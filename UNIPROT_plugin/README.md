@@ -1,175 +1,153 @@
 # UniProt Structures PyMOL Plugin
 
-Load UniProt-linked experimental structures and the matching AlphaFold model into PyMOL.
-The plugin accepts either a UniProt accession, for example `P06730`, or a UniProt entry
-name, for example `IF4E_HUMAN`.
+Download UniProt-linked PDB/mmCIF structures and AlphaFold models, organize them by
+experimental method, and align one mapped protein chain per structure.
 
-For each UniProt entry it will:
+## Activate the updated source
 
-- resolve the UniProt accession and entry name;
-- read PDB cross-references from UniProt;
-- download the AlphaFold model;
-- download experimental coordinate files from RCSB, trying `.pdb` first and `.cif` if needed;
-- keep only the chains mapped to that UniProt entry;
-- organize objects by experimental method;
-- align each PDB object to the AlphaFold object using chain A when present.
-
-## Quick Use
+In the PyMOL command line:
 
 ```pymol
 run H:/My Drive/VSCode_Github/Pymol/UNIPROT_plugin/__init__.py
-uniprot_structures P06730
-```
-
-Equivalent entry-name example:
-
-```pymol
-uniprot_structures IF4E_HUMAN
-```
-
-For a safer memory-friendly test:
-
-```pymol
-delete all
-uniprot_structures P06730, 1, 1, 1, align, 10
-```
-
-## PyMOL Layout
-
-For `P06730` / `IF4E_HUMAN`, the root group is:
-
-```text
-IF4E_HUMAN
-```
-
-Inside it:
-
-- `AF_IF4E_HUMAN` stays directly in the root group.
-- `NMR` contains NMR structures.
-- `X-ray` contains X-ray crystallography structures.
-- `EM` contains electron microscopy structures.
-- `Other_methods` is created only if a PDB entry uses another method.
-
-Each experimental structure is kept as one PyMOL object named with only its PDB code,
-for example `7XTP` or `3U7X`. If a PDB contains multiple UniProt-mapped chains, they
-stay together inside that single PDB object.
-
-PyMOL object and group names are global. If you load multiple UniProt entries in the
-same PyMOL session, PyMOL may add suffixes such as `NMR_2` to avoid name collisions,
-but the groups are still placed under the relevant UniProt root group.
-
-## Alignment Behavior
-
-The AlphaFold object is the reference. For each PDB object, the plugin aligns using
-chain A if chain A exists:
-
-```pymol
-align 7XTP & c. A, AF_IF4E_HUMAN
-```
-
-In code this is equivalent to using the mobile selection:
-
-```text
-(7XTP) and chain A
-```
-
-The transform is applied to the PDB object, so the object remains a single object. If
-chain A is not present, the plugin falls back to aligning the whole PDB object.
-
-Available alignment methods:
-
-- `align`, default;
-- `super`;
-- `cealign`.
-
-## Install
-
-In PyMOL:
-
-1. Open `Plugin > Plugin Manager`.
-2. Choose `Install New Plugin`.
-3. Select this file:
-
-```text
-H:\My Drive\VSCode_Github\Pymol\UNIPROT_plugin\__init__.py
-```
-
-You can also load it for the current PyMOL session:
-
-```pymol
-run H:/My Drive/VSCode_Github/Pymol/UNIPROT_plugin/__init__.py
-```
-
-## GUI
-
-After installation, open:
-
-```text
-Plugin > UniProt Structures
-```
-
-If the menu does not open the window, reload the source file and run:
-
-```pymol
 uniprot_structures_gui
 ```
 
-## Command
+For permanent installation, reinstall this source through Plugin > Plugin Manager >
+Install New Plugin, then restart PyMOL. An already installed copy will not update
+just because the source on H: changed.
 
-```pymol
-uniprot_structures query [, include_pdb [, include_alphafold [, align [, alignment_method [, limit]]]]]
+## GUI
+
+Open Plugin > UniProt Structures, or use `uniprot_structures_gui`.
+
+- Enter a UniProt accession (`P06730`) or entry name (`IF4E_HUMAN`).
+- Alternatively, **Browse...** beside **List file** selects a TXT, CSV or TSV file.
+  A selected file takes priority over the single-entry field; clear it to use that field.
+- Choose a **Download folder** for persistent files, or leave blank for the system
+  temporary cache. Each protein has its own subfolder.
+- Choose PDB, AlphaFold, or both, and an alignment method (`align`, `super`, `cealign`).
+- Set **PDB limit per protein**; zero means all available PDB references.
+- For many proteins/structures, use **Download only** to save files without adding
+  objects to PyMOL or consuming memory for the full collection.
+- Click **Start**. The window stays responsive, displays elapsed time, a progress
+  bar, and an activity log. The PyMOL console receives the same activity messages.
+- **Cancel** stops cooperatively. Finished files and objects are retained. A running
+  network read may take up to its timeout (60 seconds); a PyMOL load or alignment
+  must finish before cancellation takes effect. Closing a busy dialog requests cancellation.
+
+Progress is reported separately for each protein: structures processed / total,
+percentage, remaining, freshly downloaded, reused from cache, download failures,
+and loaded objects. Transfer messages also show MB received and, when the server
+supplies a size, that file's transfer percentage. **Processed** includes failed jobs;
+100% processed does not mean every structure downloaded or aligned successfully.
+The final batch message includes the error count. Detailed failures remain in the log.
+
+## Input files
+
+A plain TXT list can contain one entry per line or whitespace-separated entries:
+
+```text
+# UniProt accessions or entry names
+P06730
+IF4E_HUMAN
+P04637
 ```
 
-Examples:
+CSV/TSV can contain a recognized UniProt column, for example:
+
+```csv
+accession,note
+P06730,eIF4E
+P04637,p53
+```
+
+Accepted column headings include `uniprot`, `uniprot_id`, `uniprot_accession`,
+`accession`, `entry`, and `entry_name` (spaces or hyphens also accepted).
+Without a recognized heading, the first CSV/TSV column is used. UTF-8 files,
+including UTF-8 BOM, are supported. Blank lines, lines beginning with `#`, and
+exact duplicate entries are ignored. Protein names as free text and gene symbols
+are not resolved: use UniProt accessions or UniProt entry names.
+
+## Visualization and alignment
+
+Each PDB object keeps **one UniProt-mapped protein chain**: chain A when A is mapped
+and present, otherwise the first available mapped chain. If UniProt provides no
+chain mapping, the first protein chain is used, preferring A. If a supplied mapping
+matches no protein chain, the structure is skipped and the reason is logged.
+Unrelated chains, ligands and waters are removed from the PyMOL object; cached
+coordinate files remain complete. All model states, including NMR ensembles, are
+retained. The selected chain is reported in the activity log.
+
+Structures are aligned as they load, using the protein chain against a single
+protein chain in the AlphaFold reference. If AlphaFold is absent, disabled, or fails
+to load, the first successfully loaded PDB becomes the reference. Alignment failures
+are logged and the affected objects are hidden and disabled, so they do not appear
+as if they were successfully fitted. Successful structures are shown as cartoons.
+With alignment switched off, selected chains are displayed without fitting.
+
+The root group is the UniProt entry name, with `AF_<entry_name>` directly inside it.
+Experimental PDB objects use their PDB codes and are grouped under `NMR`, `X-ray`,
+`EM`, or `Other_methods`. Repeated runs use unique names to preserve existing objects.
+Only the objects created by the current job have their representations changed.
+
+## Commands
+
+Existing positional syntax is preserved, with new trailing options:
+
+```pymol
+uniprot_structures query, include_pdb, include_alphafold, align, alignment_method, limit, download_only, cache_dir
+```
+
+Defaults: both sources enabled, alignment enabled, method `align`, limit `0`,
+`download_only=0`, and the system temporary cache.
 
 ```pymol
 uniprot_structures P06730
-uniprot_structures IF4E_HUMAN, 1, 1, 1, super
 uniprot_structures P06730, 1, 1, 1, align, 10
+uniprot_structures P06730, 1, 1, 1, align, 0, 1, D:/UniProt_cache/P06730
 ```
 
-Arguments:
+The last example downloads all selected files without loading them into PyMOL.
 
-- `query`: UniProt accession or entry name.
-- `include_pdb`: `1` or `0`, default `1`.
-- `include_alphafold`: `1` or `0`, default `1`.
-- `align`: `1` or `0`, default `1`.
-- `alignment_method`: `align`, `super`, or `cealign`, default `align`.
-- `limit`: maximum number of PDB cross-references to load; `0` means all.
-
-## Downloads And Cache
-
-The plugin downloads real coordinate files to your filesystem and then loads them into
-PyMOL. By default, files are cached in your system temp directory under:
-
-```text
-pymol_uniprot_structures\<UniProt entry name>
-```
-
-The exact folder is printed in the PyMOL console after loading, for example:
-
-```text
-[UniProt plugin] downloaded files are in: C:\Users\...\AppData\Local\Temp\pymol_uniprot_structures\IF4E_HUMAN
-```
-
-Failed coordinate downloads are skipped, so one missing PDB/mmCIF file does not stop
-loading or alignment of the remaining structures.
-
-## Memory Notes
-
-Some UniProt entries have many PDB cross-references, and EM/mmCIF structures can be
-large. Loading all structures for several UniProt entries in one PyMOL session can hit
-memory limits. Use the `limit` argument for testing or large proteins:
+Batch file command (limit applies to each protein):
 
 ```pymol
-uniprot_structures P06730, 1, 1, 1, align, 5
+uniprot_structures_file H:/My Drive/uniprot_list.txt, 10
+uniprot_structures_file H:/My Drive/uniprot_list.txt, 0, 1, D:/UniProt_cache
 ```
 
-The command currently expects one UniProt query at a time. A comma-separated or
-space-separated list is not treated as a batch list.
+GUI jobs run in a background worker. Command-line calls run synchronously and print
+progress to the console. Only one job can run at a time. Batch entries run sequentially;
+an entry failure is logged and does not prevent later entries from being attempted.
 
-## Data Sources
+## Downloads and memory
 
-- UniProt REST API resolves the accession / entry name and reads PDB cross-references.
-- AlphaFold DB API provides the AlphaFold model download URL.
-- RCSB downloads provide the experimental coordinate files.
+The default cache is `<system temp>/pymol_uniprot_structures/<entry_name>`.
+The exact path is reported. RCSB downloads try PDB first, then mmCIF on a 404.
+Downloads use fixed-size buffers and atomic file replacement, so interrupted or
+failed transfers do not leave a partial file that is reused as a completed download.
+Existing nonempty files are reused; older cache files are not structurally validated.
+
+Pruning chains in place avoids a second full PyMOL object, but PyMOL must initially
+load each complete coordinate file. Large assemblies and NMR ensembles can still
+require substantial memory. Loading many structures retains them in the scene;
+the worker and progress bar do not impose a memory ceiling. Use a modest PDB limit
+for visualization and **Download only** for bulk acquisition.
+
+## Verification
+
+`test_plugin.py` covers list parsing, progress and cache accounting, atomic-download
+failure/cancellation handling, batch failure recovery, and actual headless PyMOL
+chain selection, fitting, and failed-alignment visibility. Run with a Python
+interpreter that provides PyMOL (for example PyMOL's bundled Python):
+
+```powershell
+& 'C:\Users\geras\AppData\Local\Schrodinger\PyMOL2\python.exe' -B 'H:\My Drive\VSCode_Github\Pymol\UNIPROT_plugin\test_plugin.py'
+```
+
+## Data and API sources
+
+- [UniProt REST API](https://www.uniprot.org/help/api_queries)
+- [AlphaFold DB](https://alphafold.ebi.ac.uk/)
+- [RCSB coordinate downloads](https://files.rcsb.org/download/)
+- [PyMOL command implementation](https://github.com/schrodinger/pymol-open-source/blob/master/modules/pymol/importing.py)

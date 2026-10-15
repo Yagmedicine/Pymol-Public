@@ -12,6 +12,8 @@ Then use:
 from __future__ import annotations
 
 import json
+import csv
+import queue
 import os
 import re
 import tempfile
@@ -21,7 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 try:
     from pymol import cmd
@@ -33,8 +35,9 @@ UNIPROT_BASE = "https://rest.uniprot.org/uniprotkb"
 ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api/prediction/{accession}"
 RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 RCSB_CIF_URL = "https://files.rcsb.org/download/{pdb_id}.cif"
-USER_AGENT = "PyMOL-UniProt-Structures-Plugin/1.0"
+USER_AGENT = "PyMOL-UniProt-Structures-Plugin/1.1"
 _OPEN_DIALOGS = []
+_RUN_LOCK = threading.Lock()
 
 
 @dataclass
@@ -58,43 +61,73 @@ def _http_json(url: str, timeout: int = 30) -> object:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _download(url: str, path: str, timeout: int = 60) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+class Cancelled(Exception):
+    """Cooperative cancellation; completed files and objects are retained."""
+
+
+def _check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise Cancelled("Cancelled; completed files and objects have been kept.")
+
+
+def _report(progress, message, completed=0, total=0):
+    print(f"[UniProt plugin] {message}", flush=True)
+    if progress is not None:
+        progress({"message": message, "completed": completed, "total": total})
+
+
+def _cached(path):
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _download(url, path, timeout=60, progress=None, cancel=None):
+    # Bounded buffers and atomic replacement prevent partial files becoming cache hits.
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response, open(path, "wb") as handle:
-        handle.write(response.read())
+    fd, partial = tempfile.mkstemp(prefix=".uniprot-", suffix=".part", dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                size = int(response.headers.get("Content-Length") or 0)
+                received = 0
+                last_update = 0.0
+                while True:
+                    _check_cancel(cancel)
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    received += len(chunk)
+                    now = time.monotonic()
+                    if now - last_update >= 1:
+                        fraction = f" ({received / size:.0%})" if size else ""
+                        _report(progress, f"Downloading {os.path.basename(path)}: {received / 1048576:.1f} MB{fraction}")
+                        last_update = now
+                if received == 0 or (size and received != size):
+                    raise IOError("Empty or incomplete download")
+        _check_cancel(cancel)
+        os.replace(partial, path)
+    finally:
+        if os.path.exists(partial):
+            os.remove(partial)
 
 
-def _download_pdb_or_cif(pdb_id: str, cache_dir: str) -> Optional[str]:
-    pdb_path = os.path.join(cache_dir, f"{pdb_id}.pdb")
-    if os.path.exists(pdb_path):
-        return pdb_path
-
-    cif_path = os.path.join(cache_dir, f"{pdb_id}.cif")
-    if os.path.exists(cif_path):
-        return cif_path
-
-    attempts = (
-        (RCSB_PDB_URL.format(pdb_id=pdb_id), pdb_path),
-        (RCSB_CIF_URL.format(pdb_id=pdb_id), cif_path),
-    )
+def _download_pdb_or_cif(pdb_id, cache_dir, progress=None, cancel=None):
+    attempts = [(RCSB_PDB_URL.format(pdb_id=pdb_id), os.path.join(cache_dir, f"{pdb_id}.pdb")),
+                (RCSB_CIF_URL.format(pdb_id=pdb_id), os.path.join(cache_dir, f"{pdb_id}.cif"))]
+    for _, path in attempts:
+        if _cached(path):
+            return path
     for url, path in attempts:
+        _check_cancel(cancel)
         try:
-            print(f"[UniProt plugin] downloading PDB {pdb_id} from {url}...")
-            _download(url, path)
+            _download(url, path, progress=progress, cancel=cancel)
             return path
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                print(f"[UniProt plugin] {pdb_id}: {os.path.basename(path)} not found; trying next format.")
-                continue
-            print(f"[UniProt plugin] {pdb_id}: download failed ({exc}); skipped.")
-            return None
-        except Exception as exc:
-            print(f"[UniProt plugin] {pdb_id}: download failed ({exc}); skipped.")
-            return None
-
-    print(f"[UniProt plugin] {pdb_id}: no PDB or mmCIF coordinate file found; skipped.")
-    return None
+            if exc.code != 404:
+                raise
+            _report(progress, f"{pdb_id}: {os.path.basename(path)} unavailable; trying next format.")
+    raise IOError(f"{pdb_id}: neither PDB nor mmCIF file is available")
 
 
 def _safe_name(value: str) -> str:
@@ -194,7 +227,7 @@ def _unique_object_name(base: str) -> str:
         return base
     name = base
     index = 2
-    existing = set(cmd.get_names("objects"))
+    existing = set(cmd.get_names("all"))
     while name in existing:
         name = f"{base}_{index}"
         index += 1
@@ -227,233 +260,449 @@ def _ensure_method_groups(entry_group: str, include_other: bool = False) -> Dict
     return groups
 
 
-def _load_related_chains(path: str, pdb_id: str, chains: Sequence[str], subgroup_name: str) -> Optional[str]:
-    temp_name = _unique_object_name(f"_{_safe_name(subgroup_name)}_{pdb_id}_full")
+def _protein_chain(object_name, mapped_chains=()):
+    available = cmd.get_chains(f"({object_name}) and polymer.protein")
+    candidates = [chain for chain in available if not mapped_chains or chain in mapped_chains]
+    if not candidates:
+        raise ValueError(f"No protein chains match UniProt mapping {list(mapped_chains)}")
+    return "A" if "A" in candidates else candidates[0]
+
+
+def _protein_selection(object_name, chain):
+    # Quoted chain identifiers support blank and multi-character mmCIF identifiers.
+    return f"({object_name}) and polymer.protein and chain {json.dumps(chain)}"
+
+
+def _load_related_chains(path, pdb_id, chains, subgroup_name, progress=None):
+    temp_name = _unique_object_name(f"_uniprot_{pdb_id}_full")
     final_name = _unique_object_name(pdb_id)
-    cmd.load(path, temp_name)
-
-    if chains:
-        selection = _chain_selection(temp_name, chains)
-        if cmd.count_atoms(selection) == 0:
-            cmd.delete(temp_name)
-            print(f"[UniProt plugin] {pdb_id}: no atoms found for chains {', '.join(chains)}; skipped.")
-            return None
-        cmd.create(final_name, selection)
-        cmd.delete(temp_name)
-    else:
+    try:
+        cmd.load(path, temp_name, zoom=0)
+        chain = _protein_chain(temp_name, chains)
+        selection = _protein_selection(temp_name, chain)
+        # Prune in place instead of making a second copy of a large assembly.
+        cmd.remove(f"({temp_name}) and not ({selection})")
         cmd.set_name(temp_name, final_name)
+        cmd.group(subgroup_name, final_name)
+        cmd.hide("everything", final_name)
+        _report(progress, f"{pdb_id}: keeping mapped protein chain {chain!r} (all model states).")
+        return final_name
+    except BaseException:
+        cmd.delete(temp_name)
+        cmd.delete(final_name)
+        raise
 
-    cmd.group(subgroup_name, final_name)
-    return final_name
+
+def _align_object(object_name, reference, method, progress):
+    mobile = f"({object_name}) and polymer.protein"
+    target_chain = _protein_chain(reference)
+    target = _protein_selection(reference, target_chain)
+    _report(progress, f"Aligning {object_name} to {reference}, reference chain {target_chain!r}, using {method}...")
+    if method == "super":
+        result = cmd.super(mobile, target, transform=1)
+    elif method == "cealign":
+        result = cmd.cealign(target, mobile)
+    else:
+        result = cmd.align(mobile, target, transform=1)
+    # API error returns and empty alignments must not be treated as successful fits.
+    if isinstance(result, (int, float)) or result is None:
+        raise ValueError(f"Alignment returned no fit: {result}")
+    count = result.get("alignment_length", 0) if isinstance(result, dict) else result[1]
+    if count <= 0:
+        raise ValueError("Alignment contains no matched atoms")
+    _report(progress, f"Aligned {object_name}: {result}")
 
 
-def _mobile_alignment_selection(object_name: str, preferred_chain: str = "A") -> str:
-    preferred = f"({object_name}) and chain {preferred_chain}"
-    if cmd.count_atoms(preferred):
-        return preferred
-    print(f"[UniProt plugin] {object_name}: chain {preferred_chain} not found; aligning whole object.")
-    return object_name
+def read_uniprot_file(filename):
+    """Read TXT lists or a UniProt column in CSV/TSV; preserve order, remove duplicates."""
+    with open(os.path.expanduser(filename), encoding="utf-8-sig", newline="") as handle:
+        lines = [line for line in handle if line.strip() and not line.lstrip().startswith("#")]
+    if not lines:
+        raise ValueError("The input file contains no UniProt entries.")
+    headers = {"uniprot", "uniprot_id", "uniprot_accession", "accession", "entry", "entry_name", "uniprot_entry_name"}
+    delimiter = next((d for d in ("\t", ",", ";") if d in lines[0]), None)
+    rows = list(csv.reader(lines, delimiter=delimiter)) if delimiter else [line.split() for line in lines]
+    normalized = [re.sub(r"[ -]+", "_", field.strip().lower()) for field in rows[0]]
+    column = next((i for i, field in enumerate(normalized) if field in headers), None)
+    if column is not None:
+        rows = rows[1:]
+        values = [row[column].strip() for row in rows if len(row) > column]
+    elif delimiter:
+        values = [row[0].strip() for row in rows if row]
+    else:
+        values = [value for row in rows for value in row]
+    queries = list(dict.fromkeys(value for value in values if value))
+    if not queries:
+        raise ValueError("The input file contains no UniProt entries.")
+    return queries
 
-def _align_to_reference(objects: Iterable[str], reference: str, method: str = "align") -> None:
-    for object_name in objects:
-        if object_name == reference:
-            continue
-        mobile_selection = _mobile_alignment_selection(object_name, "A")
-        try:
-            print(f"[UniProt plugin] aligning {mobile_selection} -> {reference} with {method}")
-            if method == "super":
-                result = cmd.super(mobile_selection, reference, transform=1)
-            elif method == "cealign":
-                result = cmd.cealign(reference, mobile_selection)
-            else:
-                result = cmd.align(mobile_selection, reference, transform=1)
-            print(f"[UniProt plugin] aligned {object_name} to {reference}: {result}")
-        except Exception as exc:
-            print(f"[UniProt plugin] alignment failed for {object_name}: {exc}")
 
-def load_uniprot_structures(
-    query: str,
-    include_pdb: bool = True,
-    include_alphafold: bool = True,
-    align: bool = True,
-    alignment_method: str = "align",
-    cache_dir: Optional[str] = None,
-    limit: int = 0,
-) -> Dict[str, object]:
-    if cmd is None:
-        raise RuntimeError("This plugin must be run inside PyMOL.")
-
+def _load_uniprot_structures(query, include_pdb=True, include_alphafold=True, align=True,
+                             alignment_method="align", cache_dir=None, limit=0,
+                             download_only=False, progress=None, cancel=None):
+    if not download_only and cmd is None:
+        raise RuntimeError("Loading structures requires PyMOL.")
+    if limit < 0:
+        raise ValueError("PDB limit must be zero or positive.")
+    if alignment_method not in ("align", "super", "cealign"):
+        raise ValueError("Alignment method must be align, super, or cealign.")
+    _check_cancel(cancel)
+    _report(progress, f"Resolving UniProt {query}...")
     entry = resolve_uniprot(query)
-    group_name = _safe_name(entry.entry_name)
-    cache_dir = cache_dir or os.path.join(tempfile.gettempdir(), "pymol_uniprot_structures", group_name)
+    _check_cancel(cancel)
+    group_name = _safe_name(entry.entry_name) if download_only else _unique_object_name(_safe_name(entry.entry_name))
+    cache_dir = cache_dir or os.path.join(tempfile.gettempdir(), "pymol_uniprot_structures", _safe_name(entry.entry_name))
     os.makedirs(cache_dir, exist_ok=True)
-
-    cmd.group(group_name)
-    method_groups = _ensure_method_groups(group_name)
-    loaded: List[str] = []
-    reference: Optional[str] = None
-
-    print(f"[UniProt plugin] UniProt: {entry.entry_name} ({entry.accession})")
-    print(f"[UniProt plugin] PDB cross-references in UniProt: {len(entry.pdb_refs)}")
-
+    pdb_refs = [ref for ref in entry.pdb_refs if ref.pdb_id] if include_pdb else []
+    pdb_refs = list({ref.pdb_id: ref for ref in pdb_refs}.values())[:limit or None]
+    _report(progress, f"{entry.entry_name} ({entry.accession}): {len(entry.pdb_refs)} PDB references found; {len(pdb_refs)} selected. Cache: {cache_dir}")
+    af_url = None
+    errors = []
     if include_alphafold:
-        af_url = get_alphafold_pdb_url(entry.accession)
-        if af_url:
-            extension = ".cif" if af_url.lower().endswith(".cif") else ".pdb"
-            af_path = os.path.join(cache_dir, f"AlphaFold_{entry.accession}{extension}")
-            if not os.path.exists(af_path):
-                print(f"[UniProt plugin] downloading AlphaFold model...")
-                _download(af_url, af_path)
-            reference = _unique_object_name(f"AF_{group_name}")
-            cmd.load(af_path, reference)
-            cmd.group(group_name, reference)
-            loaded.append(reference)
-        else:
-            print(f"[UniProt plugin] no AlphaFold model found for {entry.accession}.")
+        _report(progress, "Looking up AlphaFold model...")
+        try:
+            af_url = get_alphafold_pdb_url(entry.accession)
+            if not af_url:
+                _report(progress, "No AlphaFold model available.")
+        except MemoryError:
+            raise
+        except Exception as exc:
+            errors.append(f"AlphaFold lookup: {exc}")
+            _report(progress, errors[-1])
+    jobs = ([None] if af_url else []) + pdb_refs
+    total = len(jobs)
+    completed = downloaded = cached = failed = 0
+    loaded, visible, files = [], [], []
+    reference = None
+    method_groups = {}
+    if not download_only:
+        cmd.group(group_name)
+        method_groups = _ensure_method_groups(group_name)
 
-    pdb_refs = entry.pdb_refs[: limit or None]
-    if include_pdb:
-        for ref in pdb_refs:
-            if not ref.pdb_id:
-                continue
-            pdb_path = _download_pdb_or_cif(ref.pdb_id, cache_dir)
-            if not pdb_path:
-                continue
-            time.sleep(0.1)
-            subgroup_label = _method_subgroup(ref.method)
-            if subgroup_label not in method_groups:
-                subgroup = _unique_object_name(subgroup_label)
-                cmd.group(subgroup)
-                cmd.group(group_name, subgroup)
-                method_groups[subgroup_label] = subgroup
-            subgroup_name = method_groups[subgroup_label]
-            object_name = _load_related_chains(pdb_path, ref.pdb_id, ref.chains, subgroup_name)
-            if object_name:
-                loaded.append(object_name)
+    def status(message):
+        _report(progress, f"{entry.entry_name}: {completed}/{total} processed ({completed / total:.0%}); "
+                f"{total-completed} remaining; {downloaded} downloaded, {cached} cached, {failed} failed; "
+                f"{len(loaded)} loaded. {message}", completed, total)
 
-    if align and reference:
-        _align_to_reference(loaded, reference, alignment_method)
-    elif align:
-        print("[UniProt plugin] no AlphaFold reference loaded; alignment skipped.")
+    def activity(event):
+        if progress is not None:
+            progress(dict(event, completed=completed, total=total))
 
-    cmd.zoom(group_name)
-    print(f"[UniProt plugin] loaded {len(loaded)} object(s) in group '{group_name}'.")
-    print(f"[UniProt plugin] downloaded files are in: {cache_dir}")
-    return {
-        "accession": entry.accession,
-        "entry_name": entry.entry_name,
-        "group": group_name,
-        "loaded": loaded,
-        "cache_dir": cache_dir,
-        "pdb_count": len(entry.pdb_refs),
-    }
+    status("Starting." if total else "No coordinate files to process.")
+    for ref in jobs:
+        _check_cancel(cancel)
+        is_af = ref is None
+        label = "AlphaFold" if is_af else ref.pdb_id
+        status(f"Fetching {label}...")
+        try:
+            if is_af:
+                extension = ".cif" if urllib.parse.urlparse(af_url).path.lower().endswith(".cif") else ".pdb"
+                path = os.path.join(cache_dir, f"AlphaFold_{entry.accession}{extension}")
+                was_cached = _cached(path)
+                if not was_cached:
+                    _download(af_url, path, progress=activity, cancel=cancel)
+            else:
+                was_cached = any(_cached(os.path.join(cache_dir, ref.pdb_id + ext)) for ext in (".pdb", ".cif"))
+                path = _download_pdb_or_cif(ref.pdb_id, cache_dir, progress=activity, cancel=cancel)
+            cached += int(was_cached)
+            downloaded += int(not was_cached)
+            files.append(path)
+        except (Cancelled, MemoryError):
+            raise
+        except Exception as exc:
+            failed += 1
+            errors.append(f"{label} download: {exc}")
+            completed += 1
+            status(errors[-1])
+            continue
+        _check_cancel(cancel)
+        if not download_only:
+            obj = None
+            try:
+                status(f"Loading {label} into PyMOL...")
+                if is_af:
+                    obj = _load_related_chains(path, f"AF_{_safe_name(entry.entry_name)}", [], group_name, activity)
+                else:
+                    subgroup_label = _method_subgroup(ref.method)
+                    if subgroup_label not in method_groups:
+                        subgroup = _unique_object_name(subgroup_label)
+                        cmd.group(subgroup)
+                        cmd.group(group_name, subgroup)
+                        method_groups[subgroup_label] = subgroup
+                    obj = _load_related_chains(path, ref.pdb_id, ref.chains, method_groups[subgroup_label], activity)
+                loaded.append(obj)
+                _check_cancel(cancel)
+                if reference is None:
+                    reference = obj
+                    if not is_af and align:
+                        _report(activity, f"AlphaFold unavailable/disabled; using first PDB {obj} as reference.")
+                elif align:
+                    _align_object(obj, reference, alignment_method, activity)
+                cmd.show("cartoon", obj)
+                visible.append(obj)
+            except (Cancelled, MemoryError):
+                raise
+            except Exception as exc:
+                errors.append(f"{label} load/alignment: {exc}")
+                _report(activity, errors[-1])
+                if obj:
+                    cmd.hide("everything", obj)
+                    cmd.disable(obj)
+        completed += 1
+        status(f"Finished {label}.")
+    if visible:
+        cmd.zoom(" or ".join(f"({obj})" for obj in visible))
+    status(f"Done. {len(visible)} visible; {len(errors)} error(s). Files: {cache_dir}")
+    return {"accession": entry.accession, "entry_name": entry.entry_name, "group": group_name,
+            "loaded": loaded, "visible": visible, "files": files, "cache_dir": cache_dir,
+            "pdb_count": len(entry.pdb_refs), "downloaded": downloaded, "cached": cached,
+            "failed": failed, "errors": errors}
 
 
-def uniprot_structures(
-    query: str,
-    include_pdb: str = "1",
-    include_alphafold: str = "1",
-    align: str = "1",
-    alignment_method: str = "align",
-    limit: str = "0",
-) -> None:
-    """PyMOL command: load UniProt-linked PDB structures and AlphaFold model."""
-    load_uniprot_structures(
-        query=query,
-        include_pdb=bool(int(include_pdb)),
-        include_alphafold=bool(int(include_alphafold)),
-        align=bool(int(align)),
-        alignment_method=alignment_method,
-        limit=int(limit),
-    )
+def load_uniprot_structures(query, include_pdb=True, include_alphafold=True, align=True,
+                            alignment_method="align", cache_dir=None, limit=0,
+                            download_only=False, progress=None, cancel=None):
+    if not _RUN_LOCK.acquire(blocking=False):
+        raise RuntimeError("A UniProt job is already running. Cancel it or wait for it to finish.")
+    try:
+        return _load_uniprot_structures(query, include_pdb, include_alphafold, align,
+                                        alignment_method, cache_dir, limit, download_only, progress, cancel)
+    finally:
+        _RUN_LOCK.release()
 
 
-def _run_in_thread(function, *args, **kwargs) -> None:
-    thread = threading.Thread(target=function, args=args, kwargs=kwargs, daemon=True)
+def load_uniprot_batch(queries, cache_root=None, progress=None, cancel=None, **options):
+    if not _RUN_LOCK.acquire(blocking=False):
+        raise RuntimeError("A UniProt job is already running. Cancel it or wait for it to finish.")
+    summaries, errors = [], []
+    try:
+        queries = list(dict.fromkeys(q.strip() for q in queries if q.strip()))
+        if not queries:
+            raise ValueError("Enter a UniProt accession/name or choose an input file.")
+        for index, query in enumerate(queries, 1):
+            _check_cancel(cancel)
+            prefix = f"Protein {index}/{len(queries)} ({query})"
+            def report(event):
+                if progress is not None:
+                    progress(dict(event, message=f"{prefix}: {event['message']}"))
+            _report(report, f"Starting {prefix}.")
+            try:
+                folder = os.path.join(cache_root, _safe_name(query)) if cache_root else None
+                summaries.append(_load_uniprot_structures(query, cache_dir=folder, progress=report, cancel=cancel, **options))
+            except Cancelled:
+                raise
+            except MemoryError:
+                raise  # Continuing after memory exhaustion can destabilize PyMOL.
+            except Exception as exc:
+                errors.append(f"{query}: {exc}")
+                _report(report, f"Failed: {exc}; continuing with next protein.")
+        detail_errors = len(errors) + sum(len(s["errors"]) for s in summaries)
+        _report(progress, f"Batch done: {len(summaries)}/{len(queries)} proteins processed; "
+                f"{sum(s['downloaded'] for s in summaries)} downloaded, {sum(s['cached'] for s in summaries)} cached; "
+                f"{detail_errors} error(s).", len(queries), len(queries))
+        return {"summaries": summaries, "errors": errors}
+    finally:
+        _RUN_LOCK.release()
+
+
+def uniprot_structures(query, include_pdb="1", include_alphafold="1", align="1",
+                       alignment_method="align", limit="0", download_only="0", cache_dir=""):
+    """Load one UniProt entry; trailing options preserve existing command syntax."""
+    return load_uniprot_structures(query, bool(int(include_pdb)), bool(int(include_alphafold)),
+                                   bool(int(align)), alignment_method, cache_dir or None, int(limit),
+                                   bool(int(download_only)))
+
+
+def uniprot_structures_file(filename, limit="0", download_only="0", cache_dir=""):
+    """Process a TXT/CSV/TSV UniProt list sequentially."""
+    return load_uniprot_batch(read_uniprot_file(filename), cache_root=cache_dir or None,
+                              limit=int(limit), download_only=bool(int(download_only)))
+
+
+def _start_job(queries, options):
+    events = queue.Queue()
+    cancel = threading.Event()
+    def worker():
+        try:
+            result = load_uniprot_batch(queries, progress=lambda event: events.put(("progress", event)),
+                                        cancel=cancel, **options)
+            events.put(("done", result))
+        except Cancelled as exc:
+            _report(None, str(exc))
+            events.put(("cancelled", str(exc)))
+        except MemoryError:
+            message = "Out of memory. Job stopped; use Download only or a smaller PDB limit. Completed files and objects were kept."
+            _report(None, message)
+            events.put(("error", message))
+        except Exception as exc:
+            _report(None, f"Job stopped: {exc}")
+            events.put(("error", str(exc)))
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
+    return thread, cancel, events
 
 
-def _open_qt_gui() -> bool:
+def _open_qt_gui():
     try:
         from pymol import plugins
-        from pymol.Qt import QtWidgets
+        from pymol.Qt import QtWidgets, QtCore
     except Exception as exc:
         print(f"[UniProt plugin] Qt GUI is not available: {exc}")
         return False
-
     parent = None
     try:
         parent = plugins.get_qtwindow()
     except Exception:
         pass
-
-    dialog = QtWidgets.QDialog(parent)
+    job = {"thread": None, "cancel": None, "events": None, "started": 0, "message": "Ready"}
+    def busy():
+        return job["events"] is not None
+    class Dialog(QtWidgets.QDialog):
+        def reject(self):
+            if busy():
+                job["cancel"].set()
+                job["message"] = "Cancellation requested; waiting for current operation..."
+                return
+            super().reject()
+        def closeEvent(self, event):
+            if busy():
+                self.reject()
+                event.ignore()
+            else:
+                event.accept()
+    dialog = Dialog(parent)
     dialog.setWindowTitle("UniProt Structures")
-    dialog.setMinimumWidth(360)
-
+    dialog.setMinimumWidth(680)
     query_edit = QtWidgets.QLineEdit(dialog)
-    query_edit.setPlaceholderText("P06730 or IF4E_HUMAN")
-
-    pdb_check = QtWidgets.QCheckBox("Load PDB structures", dialog)
+    query_edit.setPlaceholderText("P06730 or IF4E_HUMAN (used when no list file is selected)")
+    file_edit = QtWidgets.QLineEdit(dialog)
+    file_edit.setPlaceholderText("Optional TXT, CSV or TSV list")
+    file_button = QtWidgets.QPushButton("Browse...", dialog)
+    def browse_file():
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(dialog, "UniProt list", "", "UniProt lists (*.txt *.csv *.tsv);;All files (*)")
+        if path:
+            file_edit.setText(path)
+    file_button.clicked.connect(browse_file)
+    cache_edit = QtWidgets.QLineEdit(dialog)
+    cache_edit.setPlaceholderText("Default: system temporary folder")
+    cache_button = QtWidgets.QPushButton("Browse...", dialog)
+    def browse_cache():
+        path = QtWidgets.QFileDialog.getExistingDirectory(dialog, "Download folder")
+        if path:
+            cache_edit.setText(path)
+    cache_button.clicked.connect(browse_cache)
+    pdb_check = QtWidgets.QCheckBox("Download PDB structures", dialog)
     pdb_check.setChecked(True)
-    af_check = QtWidgets.QCheckBox("Load AlphaFold model", dialog)
+    af_check = QtWidgets.QCheckBox("Download AlphaFold model", dialog)
     af_check.setChecked(True)
-    align_check = QtWidgets.QCheckBox("Align to AlphaFold", dialog)
+    align_check = QtWidgets.QCheckBox("Align structures (AlphaFold reference when available)", dialog)
     align_check.setChecked(True)
-
+    download_check = QtWidgets.QCheckBox("Download only: save files without loading into PyMOL", dialog)
     method_combo = QtWidgets.QComboBox(dialog)
     method_combo.addItems(["align", "super", "cealign"])
-
     limit_spin = QtWidgets.QSpinBox(dialog)
-    limit_spin.setRange(0, 10000)
-    limit_spin.setValue(0)
-    limit_spin.setSpecialValueText("0 = all")
-
-    status_label = QtWidgets.QLabel("Ready", dialog)
-
+    limit_spin.setRange(0, 100000)
+    limit_spin.setSpecialValueText("All (no limit)")
+    status = QtWidgets.QLabel("Ready", dialog)
+    status.setWordWrap(True)
+    bar = QtWidgets.QProgressBar(dialog)
+    bar.setRange(0, 100)
+    bar.setValue(0)
+    log = QtWidgets.QPlainTextEdit(dialog)
+    log.setReadOnly(True)
+    log.setMaximumBlockCount(1500)
     form = QtWidgets.QFormLayout()
     form.addRow("UniProt", query_edit)
-    form.addRow("", pdb_check)
-    form.addRow("", af_check)
-    form.addRow("", align_check)
+    for title, edit, button in (("List file (takes priority)", file_edit, file_button), ("Download folder", cache_edit, cache_button)):
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(edit)
+        row.addWidget(button)
+        form.addRow(title, row)
+    for widget in (pdb_check, af_check, align_check, download_check):
+        form.addRow("", widget)
     form.addRow("Alignment", method_combo)
-    form.addRow("PDB limit", limit_spin)
-    form.addRow("", status_label)
-
-    load_button = QtWidgets.QPushButton("Load", dialog)
+    form.addRow("PDB limit per protein", limit_spin)
+    form.addRow("", QtWidgets.QLabel("Keeps one mapped protein chain: A if available, otherwise the first mapped chain.", dialog))
+    load_button = QtWidgets.QPushButton("Start", dialog)
+    cancel_button = QtWidgets.QPushButton("Cancel", dialog)
+    cancel_button.setEnabled(False)
     close_button = QtWidgets.QPushButton("Close", dialog)
-    buttons = QtWidgets.QHBoxLayout()
-    buttons.addWidget(load_button)
-    buttons.addWidget(close_button)
-
-    layout = QtWidgets.QVBoxLayout(dialog)
-    layout.addLayout(form)
-    layout.addLayout(buttons)
-
-    def on_load() -> None:
-        query = query_edit.text().strip()
-        if not query:
-            QtWidgets.QMessageBox.warning(dialog, "UniProt Structures", "Enter a UniProt accession or entry name.")
+    controls = [query_edit, file_edit, file_button, cache_edit, cache_button, pdb_check,
+                af_check, align_check, download_check, method_combo, limit_spin, load_button, close_button]
+    def set_running(value):
+        for control in controls:
+            control.setEnabled(not value)
+        cancel_button.setEnabled(value)
+    def cancel_job():
+        if busy():
+            job["cancel"].set()
+            job["message"] = "Cancellation requested; waiting for current operation..."
+    cancel_button.clicked.connect(cancel_job)
+    timer = QtCore.QTimer(dialog)
+    def poll():
+        if not busy():
             return
-
+        finished = False
+        while True:
+            try:
+                kind, data = job["events"].get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                job["message"] = data["message"]
+                log.appendPlainText(data["message"])
+                total = data["total"]
+                bar.setRange(0, total if total else 0)
+                if total:
+                    bar.setValue(data["completed"])
+            else:
+                finished = True
+                if kind != "done":
+                    job["message"] = data
+                    log.appendPlainText(data)
+                if kind == "error":
+                    QtWidgets.QMessageBox.critical(dialog, "UniProt Structures", data)
+        status.setText(f"Elapsed {int(time.monotonic()-job['started'])} s | {job['message']}")
+        if finished:
+            timer.stop()
+            job["events"] = None
+            set_running(False)
+            if bar.maximum() == 0:
+                bar.setRange(0, 100)
+                bar.setValue(0)
+    timer.timeout.connect(poll)
+    def on_load():
         try:
-            status_label.setText("Loading...")
-            QtWidgets.QApplication.processEvents()
-            summary = load_uniprot_structures(
-                query=query,
-                include_pdb=pdb_check.isChecked(),
-                include_alphafold=af_check.isChecked(),
-                align=align_check.isChecked(),
-                alignment_method=method_combo.currentText(),
-                limit=limit_spin.value(),
-            )
-            status_label.setText(f"Loaded {len(summary['loaded'])} object(s) in {summary['group']}")
+            queries = read_uniprot_file(file_edit.text().strip()) if file_edit.text().strip() else [query_edit.text().strip()]
+            if not any(queries):
+                raise ValueError("Enter a UniProt accession/name or browse to a list file.")
+            if not pdb_check.isChecked() and not af_check.isChecked():
+                raise ValueError("Select PDB structures, AlphaFold, or both.")
+            options = dict(include_pdb=pdb_check.isChecked(), include_alphafold=af_check.isChecked(),
+                           align=align_check.isChecked(), alignment_method=method_combo.currentText(),
+                           limit=limit_spin.value(), download_only=download_check.isChecked(),
+                           cache_root=cache_edit.text().strip() or None)
+            set_running(True)
+            log.clear()
+            bar.setRange(0, 0)
+            job["started"] = time.monotonic()
+            job["message"] = "Starting..."
+            job["thread"], job["cancel"], job["events"] = _start_job(queries, options)
+            timer.start(200)
         except Exception as exc:
-            status_label.setText("Failed")
-            QtWidgets.QMessageBox.critical(dialog, "UniProt Structures", str(exc))
-
+            set_running(False)
+            QtWidgets.QMessageBox.warning(dialog, "UniProt Structures", str(exc))
     load_button.clicked.connect(on_load)
     close_button.clicked.connect(dialog.close)
+    buttons = QtWidgets.QHBoxLayout()
+    for button in (load_button, cancel_button, close_button):
+        buttons.addWidget(button)
+    layout = QtWidgets.QVBoxLayout(dialog)
+    layout.addLayout(form)
+    layout.addWidget(status)
+    layout.addWidget(bar)
+    layout.addWidget(log)
+    layout.addLayout(buttons)
     dialog.finished.connect(lambda _code: _OPEN_DIALOGS.remove(dialog) if dialog in _OPEN_DIALOGS else None)
     _OPEN_DIALOGS.append(dialog)
     dialog.show()
@@ -461,97 +710,157 @@ def _open_qt_gui() -> bool:
     dialog.activateWindow()
     return True
 
-def _open_gui(*_args, **_kwargs) -> None:
+
+def _open_gui(*_args, **_kwargs):
     if _open_qt_gui():
         return
-
+    # Tk fallback: worker touches only PyMOL and a queue, never Tk widgets.
     try:
         import tkinter as tk
-        from tkinter import messagebox, ttk
+        from tkinter import ttk, messagebox, filedialog
     except Exception as exc:
         print(f"[UniProt plugin] Tkinter is not available: {exc}")
         return
-
     window = tk.Toplevel()
     window.title("UniProt Structures")
-    window.resizable(False, False)
-
-    query_var = tk.StringVar(value="")
-    pdb_var = tk.BooleanVar(value=True)
-    af_var = tk.BooleanVar(value=True)
-    align_var = tk.BooleanVar(value=True)
-    method_var = tk.StringVar(value="align")
-    limit_var = tk.StringVar(value="0")
-    status_var = tk.StringVar(value="Ready")
-
     frame = ttk.Frame(window, padding=12)
-    frame.grid(row=0, column=0, sticky="nsew")
-
-    ttk.Label(frame, text="UniProt accession or entry name").grid(row=0, column=0, columnspan=2, sticky="w")
-    entry = ttk.Entry(frame, textvariable=query_var, width=34)
-    entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 8))
-    entry.focus_set()
-
-    ttk.Checkbutton(frame, text="Load PDB structures", variable=pdb_var).grid(row=2, column=0, columnspan=2, sticky="w")
-    ttk.Checkbutton(frame, text="Load AlphaFold model", variable=af_var).grid(row=3, column=0, columnspan=2, sticky="w")
-    ttk.Checkbutton(frame, text="Align to AlphaFold", variable=align_var).grid(row=4, column=0, columnspan=2, sticky="w")
-
-    ttk.Label(frame, text="Alignment").grid(row=5, column=0, sticky="w", pady=(8, 0))
-    ttk.Combobox(frame, textvariable=method_var, values=("align", "super", "cealign"), width=12, state="readonly").grid(
-        row=5, column=1, sticky="e", pady=(8, 0)
-    )
-
-    ttk.Label(frame, text="PDB limit (0 = all)").grid(row=6, column=0, sticky="w", pady=(8, 0))
-    ttk.Entry(frame, textvariable=limit_var, width=8).grid(row=6, column=1, sticky="e", pady=(8, 0))
-
-    ttk.Label(frame, textvariable=status_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 4))
-
-    def on_load() -> None:
-        query = query_var.get().strip()
-        if not query:
-            messagebox.showwarning("UniProt Structures", "Enter a UniProt accession or entry name.")
-            return
-        try:
-            limit = int(limit_var.get().strip() or "0")
-        except ValueError:
-            messagebox.showwarning("UniProt Structures", "PDB limit must be a number.")
-            return
-
-        def worker() -> None:
+    frame.grid(sticky="nsew")
+    query = tk.StringVar()
+    filename = tk.StringVar()
+    cache = tk.StringVar()
+    pdb = tk.BooleanVar(value=True)
+    af = tk.BooleanVar(value=True)
+    align = tk.BooleanVar(value=True)
+    download_only = tk.BooleanVar(value=False)
+    method = tk.StringVar(value="align")
+    limit = tk.StringVar(value="0")
+    status = tk.StringVar(value="Ready")
+    controls = []
+    for row, (label, value) in enumerate((("UniProt", query), ("List file (takes priority)", filename), ("Download folder", cache))):
+        ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+        edit = ttk.Entry(frame, textvariable=value, width=55)
+        edit.grid(row=row, column=1, sticky="ew")
+        controls.append(edit)
+    def browse_file():
+        path = filedialog.askopenfilename(parent=window, filetypes=[("UniProt lists", "*.txt *.csv *.tsv"), ("All files", "*")])
+        if path:
+            filename.set(path)
+    def browse_cache():
+        path = filedialog.askdirectory(parent=window)
+        if path:
+            cache.set(path)
+    for row, action in ((1, browse_file), (2, browse_cache)):
+        button = ttk.Button(frame, text="Browse...", command=action)
+        button.grid(row=row, column=2)
+        controls.append(button)
+    for row, (label, value) in enumerate((("Download PDB structures", pdb), ("Download AlphaFold", af),
+            ("Align structures", align), ("Download only (no PyMOL loading)", download_only)), 3):
+        widget = ttk.Checkbutton(frame, text=label, variable=value)
+        widget.grid(row=row, column=0, columnspan=3, sticky="w")
+        controls.append(widget)
+    ttk.Label(frame, text="PDB limit per protein (0 = all)").grid(row=7, column=0)
+    widget = ttk.Entry(frame, textvariable=limit, width=10)
+    widget.grid(row=7, column=1, sticky="w")
+    controls.append(widget)
+    method_widget = ttk.Combobox(frame, textvariable=method, values=("align", "super", "cealign"), state="readonly")
+    method_widget.grid(row=8, column=1, sticky="w")
+    ttk.Label(frame, text="Alignment").grid(row=8, column=0)
+    ttk.Label(frame, textvariable=status, wraplength=650).grid(row=9, column=0, columnspan=3, sticky="w")
+    bar = ttk.Progressbar(frame, maximum=100, length=650)
+    bar.grid(row=10, column=0, columnspan=3)
+    log = tk.Text(frame, width=90, height=12, state="disabled")
+    log.grid(row=11, column=0, columnspan=3)
+    job = {"events": None, "cancel": None}
+    def append(message):
+        log.configure(state="normal")
+        log.insert("end", message + "\n")
+        if int(log.index("end-1c").split(".")[0]) > 1500:
+            log.delete("1.0", "100.0")
+        log.see("end")
+        log.configure(state="disabled")
+    def set_running(value):
+        for control in controls:
+            control.configure(state="disabled" if value else "normal")
+        method_widget.configure(state="disabled" if value else "readonly")
+        cancel_button.configure(state="normal" if value else "disabled")
+    def poll():
+        finished = False
+        while True:
             try:
-                status_var.set("Loading...")
-                summary = load_uniprot_structures(
-                    query=query,
-                    include_pdb=pdb_var.get(),
-                    include_alphafold=af_var.get(),
-                    align=align_var.get(),
-                    alignment_method=method_var.get(),
-                    limit=limit,
-                )
-                status_var.set(f"Loaded {len(summary['loaded'])} object(s) in {summary['group']}")
-            except Exception as exc:
-                status_var.set("Failed")
-                messagebox.showerror("UniProt Structures", str(exc))
+                kind, data = job["events"].get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                job["message"] = data["message"]
+                append(data["message"])
+                if data["total"]:
+                    bar.configure(value=100 * data["completed"] / data["total"])
+            else:
+                finished = True
+                if kind != "done":
+                    job["message"] = data
+                    append(data)
+                if kind == "error":
+                    messagebox.showerror("UniProt Structures", data, parent=window)
+        status.set(f"Elapsed {int(time.monotonic()-job['started'])} s | {job['message']}")
+        if finished:
+            job["events"] = None
+            set_running(False)
+        else:
+            window.after(200, poll)
+    def on_load():
+        try:
+            queries = read_uniprot_file(filename.get().strip()) if filename.get().strip() else [query.get().strip()]
+            n = int(limit.get() or "0")
+            if n < 0 or not any(queries) or not (pdb.get() or af.get()):
+                raise ValueError("Choose UniProt input, at least one structure source, and a nonnegative limit.")
+            options = dict(include_pdb=pdb.get(), include_alphafold=af.get(), align=align.get(),
+                           download_only=download_only.get(), alignment_method=method.get(), limit=n,
+                           cache_root=cache.get().strip() or None)
+            set_running(True)
+            job["started"] = time.monotonic()
+            job["message"] = "Starting..."
+            job["thread"], job["cancel"], job["events"] = _start_job(queries, options)
+            window.after(200, poll)
+        except Exception as exc:
+            set_running(False)
+            messagebox.showwarning("UniProt Structures", str(exc), parent=window)
+    def cancel_job():
+        if job["events"] is not None:
+            job["cancel"].set()
+            job["message"] = "Cancellation requested; waiting for current operation..."
+    def close():
+        if job["events"] is not None:
+            cancel_job()
+        else:
+            window.destroy()
+    start_button = ttk.Button(frame, text="Start", command=on_load)
+    start_button.grid(row=12, column=0)
+    controls.append(start_button)
+    cancel_button = ttk.Button(frame, text="Cancel", command=cancel_job, state="disabled")
+    cancel_button.grid(row=12, column=1)
+    close_button = ttk.Button(frame, text="Close", command=close)
+    close_button.grid(row=12, column=2)
+    controls.append(close_button)
+    window.protocol("WM_DELETE_WINDOW", close)
 
-        _run_in_thread(worker)
 
-    ttk.Button(frame, text="Load", command=on_load).grid(row=8, column=0, sticky="ew", pady=(4, 0))
-    ttk.Button(frame, text="Close", command=window.destroy).grid(row=8, column=1, sticky="ew", pady=(4, 0), padx=(8, 0))
-    window.bind("<Return>", lambda _event: on_load())
-
-
-def uniprot_structures_gui() -> None:
-    """PyMOL command: open the UniProt Structures GUI."""
+def uniprot_structures_gui():
+    """Open the UniProt Structures GUI."""
     _open_gui()
 
 
-def __init_plugin__(app=None) -> None:
+def _register_commands():
     if cmd is not None:
         cmd.extend("uniprot_structures", uniprot_structures)
+        cmd.extend("uniprot_structures_file", uniprot_structures_file)
         cmd.extend("uniprot_structures_gui", uniprot_structures_gui)
+
+
+def __init_plugin__(app=None):
+    _register_commands()
     try:
         from pymol.plugins import addmenuitemqt
-
         addmenuitemqt("UniProt Structures", _open_gui)
     except Exception:
         try:
@@ -560,6 +869,4 @@ def __init_plugin__(app=None) -> None:
             pass
 
 
-if cmd is not None:
-    cmd.extend("uniprot_structures", uniprot_structures)
-    cmd.extend("uniprot_structures_gui", uniprot_structures_gui)
+_register_commands()
