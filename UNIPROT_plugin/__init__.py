@@ -35,7 +35,7 @@ UNIPROT_BASE = "https://rest.uniprot.org/uniprotkb"
 ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api/prediction/{accession}"
 RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 RCSB_CIF_URL = "https://files.rcsb.org/download/{pdb_id}.cif"
-USER_AGENT = "PyMOL-UniProt-Structures-Plugin/1.1"
+USER_AGENT = "PyMOL-UniProt-Structures-Plugin/1.2"
 _OPEN_DIALOGS = []
 _RUN_LOCK = threading.Lock()
 
@@ -280,17 +280,27 @@ def _load_related_chains(path, pdb_id, chains, subgroup_name, progress=None):
         cmd.load(path, temp_name, zoom=0)
         chain = _protein_chain(temp_name, chains)
         selection = _protein_selection(temp_name, chain)
-        # Prune in place instead of making a second copy of a large assembly.
-        cmd.remove(f"({temp_name}) and not ({selection})")
+        # Keep every non-protein component, including ligands on other/blank chains.
+        # Only other protein chains are pruned; the complete object is transformed
+        # during fitting so retained ligands keep their binding-site coordinates.
+        cmd.remove(f"({temp_name}) and polymer.protein and not ({selection})")
         cmd.set_name(temp_name, final_name)
         cmd.group(subgroup_name, final_name)
         cmd.hide("everything", final_name)
-        _report(progress, f"{pdb_id}: keeping mapped protein chain {chain!r} (all model states).")
+        _report(progress, f"{pdb_id}: keeping mapped protein chain {chain!r}, all ligands, non-protein components and waters (all model states).")
         return final_name
     except BaseException:
         cmd.delete(temp_name)
         cmd.delete(final_name)
         raise
+
+
+def _show_structure(object_name):
+    cmd.show("cartoon", f"({object_name}) and polymer.protein")
+    # Sticks display bonded ligands; nonbonded displays ions and water oxygens.
+    nonprotein = f"({object_name}) and not polymer.protein"
+    cmd.show("sticks", f"({nonprotein}) and not solvent")
+    cmd.show("nonbonded", nonprotein)
 
 
 def _align_object(object_name, reference, method, progress):
@@ -438,7 +448,7 @@ def _load_uniprot_structures(query, include_pdb=True, include_alphafold=True, al
                         _report(activity, f"AlphaFold unavailable/disabled; using first PDB {obj} as reference.")
                 elif align:
                     _align_object(obj, reference, alignment_method, activity)
-                cmd.show("cartoon", obj)
+                _show_structure(obj)
                 visible.append(obj)
             except (Cancelled, MemoryError):
                 raise

@@ -149,6 +149,33 @@ class PyMOLTests(unittest.TestCase):
         self.assertEqual(self.cmd.get_chains(obj), ["B"])
         self.assertFalse(any(name.endswith("_full") for name in self.cmd.get_names("objects")))
 
+    def test_retains_displays_and_transforms_ligands_waters_and_ions(self):
+        self.cmd.load(self.path, "full")
+        # Ligand deliberately shares the discarded protein's chain A.
+        self.cmd.pseudoatom("extras", name="C1", resn="LIG", chain="A", elem="C", pos=[1, 2, 3])
+        self.cmd.pseudoatom("extras", name="C2", resn="LIG", chain="A", elem="C", pos=[2.4, 2, 3])
+        self.cmd.bond("extras and name C1", "extras and name C2")
+        self.cmd.pseudoatom("extras", name="O", resn="HOH", chain="W", resi="2", elem="O", pos=[5, 6, 7])
+        self.cmd.pseudoatom("extras", name="ZN", resn="ZN", chain="", resi="3", elem="Zn", pos=[8, 9, 10])
+        self.cmd.save(self.path, "full or extras")
+        self.cmd.delete("all")
+        ref = plugin._load_related_chains(self.path, "REF", ["B"], "group")
+        mobile = plugin._load_related_chains(self.path, "MOB", ["B"], "group")
+        self.assertEqual(self.cmd.get_chains(mobile + " and polymer.protein"), ["B"])
+        self.assertEqual(self.cmd.count_atoms(mobile + " and resn LIG"), 2)
+        self.assertEqual(self.cmd.count_atoms(mobile + " and solvent"), 1)
+        self.assertEqual(self.cmd.count_atoms(mobile + " and elem Zn"), 1)
+        plugin._show_structure(mobile)
+        self.assertEqual(self.cmd.count_atoms(mobile + " and resn LIG and rep sticks"), 2)
+        self.assertEqual(self.cmd.count_atoms(mobile + " and solvent and rep nonbonded"), 1)
+        for method in ("align", "super", "cealign"):
+            self.cmd.translate([8, -4, 3], mobile)
+            plugin._align_object(mobile, ref, method, None)
+            actual = self.cmd.get_atom_coords(mobile + " and resn LIG and name C1")
+            expected = self.cmd.get_atom_coords(ref + " and resn LIG and name C1")
+            for a, b in zip(actual, expected):
+                self.assertAlmostEqual(a, b, places=3)
+
     def test_prefers_A_only_when_mapped(self):
         obj = plugin._load_related_chains(self.path, "TEST", ["A", "B"], "group")
         self.assertEqual(self.cmd.get_chains(obj), ["A"])

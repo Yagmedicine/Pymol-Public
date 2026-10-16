@@ -74,15 +74,20 @@ Each PDB object keeps **one UniProt-mapped protein chain**: chain A when A is ma
 and present, otherwise the first available mapped chain. If UniProt provides no
 chain mapping, the first protein chain is used, preferring A. If a supplied mapping
 matches no protein chain, the structure is skipped and the reason is logged.
-Unrelated chains, ligands and waters are removed from the PyMOL object; cached
-coordinate files remain complete. All model states, including NMR ensembles, are
+Other protein chains are removed from the PyMOL object. **All non-protein atoms
+are retained**, including ligands, cofactors, ions, waters, and nucleic acids,
+regardless of their chain identifier or distance from the selected protein chain.
+Cached coordinate files remain complete. All model states, including NMR ensembles, are
 retained. The selected chain is reported in the activity log.
 
 Structures are aligned as they load, using the protein chain against a single
 protein chain in the AlphaFold reference. If AlphaFold is absent, disabled, or fails
 to load, the first successfully loaded PDB becomes the reference. Alignment failures
 are logged and the affected objects are hidden and disabled, so they do not appear
-as if they were successfully fitted. Successful structures are shown as cartoons.
+as if they were successfully fitted. Successful protein chains are shown as cartoons, non-water ligands and other
+non-protein components as sticks, and isolated atoms (including waters and ions)
+as nonbonded markers. Fitting uses only protein atoms and transforms the entire
+object together, preserving ligand positions relative to the protein.
 With alignment switched off, selected chains are displayed without fitting.
 
 The root group is the UniProt entry name, with `AF_<entry_name>` directly inside it.
