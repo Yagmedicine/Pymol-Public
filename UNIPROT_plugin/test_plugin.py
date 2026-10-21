@@ -40,6 +40,24 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.parse("# empty\n")
 
+    def test_pasted_batch_names(self):
+        expected = ["BCL2_HUMAN", "CAB39_HUMAN", "PYR1_HUMAN", "CARM1_HUMAN", "PEBB_HUMAN"]
+        for separator in (" ", "\n", "\r\n", "\t", ", ", ";"):
+            self.assertEqual(plugin.parse_uniprot_queries(separator.join(expected)), expected)
+        self.assertEqual(plugin.parse_uniprot_queries(" BCL2_HUMAN, CAB39_HUMAN; BCL2_HUMAN "), expected[:2])
+        self.assertEqual(plugin.parse_uniprot_queries(" "), [])
+        summary = {"errors": [], "downloaded": 0, "cached": 0}
+        with patch.object(plugin, "_load_uniprot_structures", return_value=summary) as load:
+            result = plugin.load_uniprot_batch(plugin.parse_uniprot_queries("\n".join(expected)))
+        self.assertEqual([call.args[0] for call in load.call_args_list], expected)
+        self.assertEqual(len(result["summaries"]), 5)
+
+    def test_resolver_rejects_unsplit_batch(self):
+        with patch.object(plugin, "_http_json") as network:
+            with self.assertRaisesRegex(ValueError, "Expected one UniProt entry"):
+                plugin.resolve_uniprot("BCL2_HUMAN\nCAB39_HUMAN")
+            network.assert_not_called()
+
     def test_atomic_download_and_cache(self):
         path = self.root / "model.pdb"
         with patch.object(plugin.urllib.request, "urlopen", return_value=Response(b"coordinates")):
@@ -143,6 +161,57 @@ class PyMOLTests(unittest.TestCase):
         self.cmd.create("full", "mapped or unrelated")
         self.cmd.save(self.path, "full")
         self.cmd.delete("all")
+
+    def test_isolates_one_of_116_groups_with_disabled_children(self):
+        self.cmd.delete("all")
+        for index in range(116):
+            group = f"PROT{index:03d}_HUMAN"
+            obj = f"pdb_{index}"
+            subgroup = f"method_{index}"
+            self.cmd.pseudoatom(obj)
+            self.cmd.group(subgroup, obj)
+            self.cmd.group(group, subgroup)
+        self.cmd.disable("all")
+        objects = plugin.uniprot_show("PROT007_HUMAN")
+        self.assertEqual(objects, ["pdb_7"])
+        enabled = set(self.cmd.get_names("objects", enabled_only=1))
+        self.assertEqual(enabled, {"PROT007_HUMAN", "method_7", "pdb_7"})
+        self.assertEqual(len(plugin.list_uniprot_groups()), 116)
+        plugin.uniprot_show("PROT008_HUMAN")
+        self.assertEqual(set(self.cmd.get_names("objects", enabled_only=1)),
+                         {"PROT008_HUMAN", "method_8", "pdb_8"})
+        plugin.uniprot_show("PROT007_HUMAN", only="0")
+        self.assertIn("PROT008_HUMAN", self.cmd.get_names("objects", enabled_only=1))
+        plugin.uniprot_hide("PROT007_HUMAN")
+        self.assertNotIn("PROT007_HUMAN", self.cmd.get_names("objects", enabled_only=1))
+
+    def test_registered_visibility_command(self):
+        self.cmd.pseudoatom("target")
+        self.cmd.pseudoatom("other")
+        self.cmd.group("X-ray", "target")
+        self.cmd.group("BCL2_HUMAN", "X-ray")
+        self.cmd.group("CAB39_HUMAN", "other")
+        self.cmd.disable("all")
+        plugin._register_commands()
+        self.cmd.do("uniprot_show BCL2_HUMAN")
+        enabled = set(self.cmd.get_names("objects", enabled_only=1))
+        self.assertEqual(enabled, {"BCL2_HUMAN", "X-ray", "target"})
+
+    def test_invalid_visibility_target_does_not_blank_scene(self):
+        self.cmd.pseudoatom("existing")
+        before = self.cmd.get_names("objects", enabled_only=1)
+        with self.assertRaises(ValueError):
+            plugin.uniprot_show("MISSING_HUMAN")
+        self.assertEqual(before, self.cmd.get_names("objects", enabled_only=1))
+        self.assertFalse(plugin._RUN_LOCK.locked())
+
+    def test_visibility_preserves_hidden_representations(self):
+        self.cmd.pseudoatom("ligand")
+        self.cmd.group("BCL2_HUMAN", "ligand")
+        self.cmd.hide("everything", "ligand")
+        plugin.uniprot_show("BCL2_HUMAN")
+        self.assertEqual(self.cmd.count_atoms("ligand and rep spheres"), 0)
+        self.assertEqual(self.cmd.count_atoms("ligand and rep nonbonded"), 0)
 
     def test_keeps_mapped_B_instead_of_unrelated_A(self):
         obj = plugin._load_related_chains(self.path, "TEST", ["B"], "group")

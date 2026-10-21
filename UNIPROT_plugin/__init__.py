@@ -35,7 +35,7 @@ UNIPROT_BASE = "https://rest.uniprot.org/uniprotkb"
 ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api/prediction/{accession}"
 RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 RCSB_CIF_URL = "https://files.rcsb.org/download/{pdb_id}.cif"
-USER_AGENT = "PyMOL-UniProt-Structures-Plugin/1.2"
+USER_AGENT = "PyMOL-UniProt-Structures-Plugin/1.4"
 _OPEN_DIALOGS = []
 _RUN_LOCK = threading.Lock()
 
@@ -179,10 +179,17 @@ def _entry_from_uniprot_json(data: dict) -> UniProtEntry:
     return UniProtEntry(accession=accession, entry_name=entry_name, pdb_refs=pdb_refs)
 
 
+def parse_uniprot_queries(text):
+    """Split pasted entry names/accessions on whitespace, commas or semicolons."""
+    return list(dict.fromkeys(value for value in re.split(r"[\s,;]+", text.strip()) if value))
+
+
 def resolve_uniprot(query: str) -> UniProtEntry:
     query = query.strip()
     if not query:
         raise ValueError("Please provide a UniProt accession or entry name.")
+    if len(parse_uniprot_queries(query)) != 1 or re.search(r"[\s,;]", query):
+        raise ValueError("Expected one UniProt entry. For several entries, paste them in the GUI or use uniprot_structures_file.")
 
     quoted = urllib.parse.quote(query)
     direct_url = f"{UNIPROT_BASE}/{quoted}.json"
@@ -529,6 +536,58 @@ def uniprot_structures_file(filename, limit="0", download_only="0", cache_dir=""
                               limit=int(limit), download_only=bool(int(download_only)))
 
 
+def list_uniprot_groups():
+    """Find entry-name groups, including those restored from a saved session."""
+    if cmd is None:
+        return []
+    return sorted(name for name in cmd.get_names("objects")
+                  if cmd.get_type(name) == "object:group"
+                  and re.fullmatch(r"[A-Z0-9]+_[A-Z][A-Z0-9]*(?:_\d+)?", name))
+
+
+def uniprot_show(group, only="1"):
+    """Show a protein and populated subgroups; only=1 hides all other scene objects."""
+    if cmd is None:
+        raise RuntimeError("This command requires PyMOL.")
+    group = group.strip()
+    exclusive = bool(int(only))
+    if not _RUN_LOCK.acquire(blocking=False):
+        raise RuntimeError("Wait for the running UniProt job to finish before changing protein visibility.")
+    try:
+        if group not in cmd.get_names("objects") or cmd.get_type(group) != "object:group":
+            raise ValueError(f"No loaded protein group named {group!r}.")
+        objects = cmd.get_object_list(f"({group})")
+        if not objects:
+            raise ValueError(f"Group {group!r} contains no molecular structures.")
+        if exclusive:
+            cmd.disable("all")
+        # Enabling a parent alone does not enable its children. Enable each molecular
+        # member with its ancestors, without serializing a potentially huge session.
+        for name in objects:
+            cmd.enable(name, parents=1)
+        cmd.zoom(group)
+        message = f"Showing {'only ' if exclusive else ''}{group}: {len(objects)} structure(s), with their parent folders enabled."
+        _report(None, message)
+        return objects
+    finally:
+        _RUN_LOCK.release()
+
+
+def uniprot_hide(group):
+    """Hide a whole protein through its parent, preserving its children's switches."""
+    if cmd is None:
+        raise RuntimeError("This command requires PyMOL.")
+    if not _RUN_LOCK.acquire(blocking=False):
+        raise RuntimeError("Wait for the running UniProt job to finish before changing protein visibility.")
+    try:
+        group = group.strip()
+        if group not in cmd.get_names("objects") or cmd.get_type(group) != "object:group":
+            raise ValueError(f"No loaded protein group named {group!r}.")
+        cmd.disable(group)
+    finally:
+        _RUN_LOCK.release()
+
+
 def _start_job(queries, options):
     events = queue.Queue()
     cancel = threading.Event()
@@ -584,7 +643,7 @@ def _open_qt_gui():
     dialog.setWindowTitle("UniProt Structures")
     dialog.setMinimumWidth(680)
     query_edit = QtWidgets.QLineEdit(dialog)
-    query_edit.setPlaceholderText("P06730 or IF4E_HUMAN (used when no list file is selected)")
+    query_edit.setPlaceholderText("One or more entries, e.g. BCL2_HUMAN CAB39_HUMAN (spaces, commas or semicolons)")
     file_edit = QtWidgets.QLineEdit(dialog)
     file_edit.setPlaceholderText("Optional TXT, CSV or TSV list")
     file_button = QtWidgets.QPushButton("Browse...", dialog)
@@ -622,7 +681,7 @@ def _open_qt_gui():
     log.setReadOnly(True)
     log.setMaximumBlockCount(1500)
     form = QtWidgets.QFormLayout()
-    form.addRow("UniProt", query_edit)
+    form.addRow("UniProt entries", query_edit)
     for title, edit, button in (("List file (takes priority)", file_edit, file_button), ("Download folder", cache_edit, cache_button)):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(edit)
@@ -639,6 +698,41 @@ def _open_qt_gui():
     close_button = QtWidgets.QPushButton("Close", dialog)
     controls = [query_edit, file_edit, file_button, cache_edit, cache_button, pdb_check,
                 af_check, align_check, download_check, method_combo, limit_spin, load_button, close_button]
+    viewer = QtWidgets.QGroupBox("View loaded proteins (no download needed)", dialog)
+    viewer_layout = QtWidgets.QHBoxLayout(viewer)
+    protein_combo = QtWidgets.QComboBox(viewer)
+    protein_combo.setObjectName("uniprot_protein_selector")
+    refresh_button = QtWidgets.QPushButton("Refresh", viewer)
+    only_button = QtWidgets.QPushButton("Show only this protein", viewer)
+    show_button = QtWidgets.QPushButton("Show", viewer)
+    hide_button = QtWidgets.QPushButton("Hide", viewer)
+    for widget in (protein_combo, refresh_button, only_button, show_button, hide_button):
+        viewer_layout.addWidget(widget)
+        controls.append(widget)
+    def refresh_proteins():
+        selected = protein_combo.currentText()
+        protein_combo.clear()
+        protein_combo.addItems(list_uniprot_groups())
+        index = protein_combo.findText(selected)
+        if index >= 0:
+            protein_combo.setCurrentIndex(index)
+    def view_protein(action):
+        try:
+            name = protein_combo.currentText()
+            if not name:
+                raise ValueError("No loaded proteins found. Load structures first, or click Refresh after opening a saved session.")
+            if action == "hide":
+                uniprot_hide(name)
+            else:
+                uniprot_show(name, only="1" if action == "only" else "0")
+            status.setText(f"{'Hidden' if action == 'hide' else 'Showing only' if action == 'only' else 'Showing'} {name}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(dialog, "Protein visibility", str(exc))
+    refresh_button.clicked.connect(refresh_proteins)
+    only_button.clicked.connect(lambda: view_protein("only"))
+    show_button.clicked.connect(lambda: view_protein("show"))
+    hide_button.clicked.connect(lambda: view_protein("hide"))
+    refresh_proteins()
     def set_running(value):
         for control in controls:
             control.setEnabled(not value)
@@ -677,13 +771,14 @@ def _open_qt_gui():
             timer.stop()
             job["events"] = None
             set_running(False)
+            refresh_proteins()
             if bar.maximum() == 0:
                 bar.setRange(0, 100)
                 bar.setValue(0)
     timer.timeout.connect(poll)
     def on_load():
         try:
-            queries = read_uniprot_file(file_edit.text().strip()) if file_edit.text().strip() else [query_edit.text().strip()]
+            queries = read_uniprot_file(file_edit.text().strip()) if file_edit.text().strip() else parse_uniprot_queries(query_edit.text())
             if not any(queries):
                 raise ValueError("Enter a UniProt accession/name or browse to a list file.")
             if not pdb_check.isChecked() and not af_check.isChecked():
@@ -709,6 +804,7 @@ def _open_qt_gui():
         buttons.addWidget(button)
     layout = QtWidgets.QVBoxLayout(dialog)
     layout.addLayout(form)
+    layout.addWidget(viewer)
     layout.addWidget(status)
     layout.addWidget(bar)
     layout.addWidget(log)
@@ -746,7 +842,7 @@ def _open_gui(*_args, **_kwargs):
     limit = tk.StringVar(value="0")
     status = tk.StringVar(value="Ready")
     controls = []
-    for row, (label, value) in enumerate((("UniProt", query), ("List file (takes priority)", filename), ("Download folder", cache))):
+    for row, (label, value) in enumerate((("UniProt entries", query), ("List file (takes priority)", filename), ("Download folder", cache))):
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
         edit = ttk.Entry(frame, textvariable=value, width=55)
         edit.grid(row=row, column=1, sticky="ew")
@@ -820,7 +916,7 @@ def _open_gui(*_args, **_kwargs):
             window.after(200, poll)
     def on_load():
         try:
-            queries = read_uniprot_file(filename.get().strip()) if filename.get().strip() else [query.get().strip()]
+            queries = read_uniprot_file(filename.get().strip()) if filename.get().strip() else parse_uniprot_queries(query.get())
             n = int(limit.get() or "0")
             if n < 0 or not any(queries) or not (pdb.get() or af.get()):
                 raise ValueError("Choose UniProt input, at least one structure source, and a nonnegative limit.")
@@ -865,6 +961,8 @@ def _register_commands():
         cmd.extend("uniprot_structures", uniprot_structures)
         cmd.extend("uniprot_structures_file", uniprot_structures_file)
         cmd.extend("uniprot_structures_gui", uniprot_structures_gui)
+        cmd.extend("uniprot_show", uniprot_show)
+        cmd.extend("uniprot_hide", uniprot_hide)
 
 
 def __init_plugin__(app=None):

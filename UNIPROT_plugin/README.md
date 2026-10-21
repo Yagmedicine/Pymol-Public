@@ -20,7 +20,10 @@ just because the source on H: changed.
 
 Open Plugin > UniProt Structures, or use `uniprot_structures_gui`.
 
-- Enter a UniProt accession (`P06730`) or entry name (`IF4E_HUMAN`).
+- Enter one or more UniProt accessions (`P06730`) or entry names (`IF4E_HUMAN`).
+  Pasted names separated by spaces, newlines, tabs, commas or semicolons are
+  processed as separate proteins. Exact duplicates are processed once. For example:
+  `BCL2_HUMAN CAB39_HUMAN PYR1_HUMAN CARM1_HUMAN PEBB_HUMAN`.
 - Alternatively, **Browse...** beside **List file** selects a TXT, CSV or TSV file.
   A selected file takes priority over the single-entry field; clear it to use that field.
 - Choose a **Download folder** for persistent files, or leave blank for the system
@@ -41,6 +44,34 @@ and loaded objects. Transfer messages also show MB received and, when the server
 supplies a size, that file's transfer percentage. **Processed** includes failed jobs;
 100% processed does not mean every structure downloaded or aligned successfully.
 The final batch message includes the error count. Detailed failures remain in the log.
+
+## Show one loaded protein
+
+The Qt dialog has a **View loaded proteins** selector. Choose a protein and click
+**Show only this protein**. This enables its molecular objects and their parent
+folders, even if subfolders were individually disabled, and disables other scene
+objects. **Show** adds the selected protein to the current view; **Hide** switches
+off its parent group. Click **Refresh** after loading a saved session externally.
+The selector also recognizes repeated groups such as `BCL2_HUMAN_2`.
+
+These commands work with already loaded sessions, including through the Tk fallback:
+
+```pymol
+uniprot_show BCL2_HUMAN
+uniprot_show CAB39_HUMAN
+uniprot_show BCL2_HUMAN, 0
+uniprot_hide BCL2_HUMAN
+```
+
+The first two commands isolate the chosen protein; `, 0` shows it alongside the
+current view. They change object switches and the camera, preserving atom
+coordinates and existing representations (including hidden waters). They do not
+restore representations previously removed with H/hide. Empty method folders may
+remain disabled because they contain no structures. No files are downloaded.
+
+`disable ! BCL2_HUMAN` excludes only the parent's name from disabling; it also
+switches off differently named children such as `X-ray` and PDB-code objects.
+Use the controls above to restore and isolate the complete protein hierarchy.
 
 ## Input files
 
