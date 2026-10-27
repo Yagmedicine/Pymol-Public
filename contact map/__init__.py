@@ -1,11 +1,11 @@
 """Contact Map: display a live CA-residue contact map for a PyMOL object.
 
-Version: 1.4.0
+Version: 1.6.0
 Purpose:
     Open a separate Qt window showing current-frame cutoff contacts or
     residue-center distances, plus mean pairwise distances and standard
-    deviations across frames. Aggregate plots can be shown separately or split
-    across the matrix diagonal and saved.
+    deviations across frames. Mean and SD plots can include per-residue column
+    profiles. Split-diagonal plots have independent scales for both halves.
 
 Usage in PyMOL:
     run /path/to/Pymol_plugins/contact_map/__init__.py
@@ -18,10 +18,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import csv
 
 import numpy as np
 
-__version__ = "1.4.0"
+__version__ = "1.6.0"
 _WINDOWS = []
 _VIRIDIS_STOPS = np.asarray((
     (0.267, 0.005, 0.329),
@@ -53,6 +54,34 @@ def _distance_matrix(coordinates):
         raise ValueError("Coordinates must have shape (residues, 3).")
     differences = coordinates[:, np.newaxis, :] - coordinates[np.newaxis, :, :]
     return np.linalg.norm(differences, axis=2)
+
+
+def _column_profile(matrix):
+    """Average eligible off-diagonal values for each residue column."""
+    values = np.asarray(matrix, dtype=float).copy()
+    if values.ndim != 2 or values.shape[0] != values.shape[1]:
+        raise ValueError("A per-residue profile requires a square matrix.")
+    np.fill_diagonal(values, np.nan)
+    valid_counts = np.sum(np.isfinite(values), axis=0)
+    totals = np.nansum(values, axis=0)
+    means = np.full(values.shape[1], np.nan, dtype=float)
+    np.divide(totals, valid_counts, out=means, where=valid_counts > 0)
+    return means
+
+
+def _write_matrix_csv(path, matrix, labels):
+    """Write a labeled raw matrix, representing filtered entries as NA."""
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.shape != (len(labels), len(labels)):
+        raise ValueError("The distance matrix and residue labels do not match.")
+    with Path(path).open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["residue", *labels])
+        for label, row in zip(labels, matrix):
+            writer.writerow([
+                label,
+                *[f"{value:.12g}" if np.isfinite(value) else "NA" for value in row],
+            ])
 
 
 def _excluded_pairs(chains, minimum_sequence_separation):
@@ -136,16 +165,23 @@ class ContactMapCanvas:
                 self._message = "No CA residues to plot."
                 self.setMinimumSize(760, 540)
 
-            def set_panels(self, panels, scale_mode, max_value):
+            def set_panels(self, panels, scale_mode, max_value,
+                           split_scale_settings=None, show_profile=False):
                 self._panels = []
                 for panel in panels:
                     if panel.get("split"):
                         mean_matrix = np.asarray(panel["mean_matrix"], dtype=float)
                         standard_deviation = np.asarray(panel["std_matrix"], dtype=float)
+                        if split_scale_settings is None:
+                            mean_scale_mode, mean_max_value = scale_mode, max_value
+                            std_scale_mode, std_max_value = scale_mode, max_value
+                        else:
+                            mean_scale_mode, mean_max_value = split_scale_settings["mean"]
+                            std_scale_mode, std_max_value = split_scale_settings["std"]
                         mean_pixels, mean_minimum, mean_maximum = _viridis_pixels(
-                            mean_matrix, scale_mode, max_value)
+                            mean_matrix, mean_scale_mode, mean_max_value)
                         std_pixels, std_minimum, std_maximum = _viridis_pixels(
-                            standard_deviation, scale_mode, max_value)
+                            standard_deviation, std_scale_mode, std_max_value)
                         upper = np.triu_indices(mean_matrix.shape[0], k=0)
                         lower = np.tril_indices(mean_matrix.shape[0], k=-1)
                         pixels = np.full((*mean_matrix.shape, 3), 255, dtype=np.uint8)
@@ -153,6 +189,8 @@ class ContactMapCanvas:
                         pixels[lower] = std_pixels[lower]
                         matrix = mean_matrix
                         minimum, maximum = mean_minimum, mean_maximum
+                        panel_mean_scale_mode = mean_scale_mode
+                        panel_std_scale_mode = std_scale_mode
                     else:
                         matrix = np.asarray(panel["matrix"], dtype=float)
                         pixels, minimum, maximum = _viridis_pixels(
@@ -175,6 +213,9 @@ class ContactMapCanvas:
                         "std_minimum": std_minimum,
                         "std_maximum": std_maximum,
                         "scale_mode": scale_mode,
+                        "mean_scale_mode": panel_mean_scale_mode if panel.get("split") else None,
+                        "std_scale_mode": panel_std_scale_mode if panel.get("split") else None,
+                        "show_profile": bool(show_profile and panel.get("profile") is not None),
                     })
                 self.update()
 
@@ -198,7 +239,9 @@ class ContactMapCanvas:
                 painter.setFont(QtGui.QFont("Segoe UI", 8))
                 for panel_index, panel in enumerate(self._panels):
                     panel_left = panel_index * panel_width
-                    left, top, right, bottom = 66, 62, 154, 72
+                    profile_visible = panel["show_profile"]
+                    profile_reserve = 235 if profile_visible else 0
+                    left, top, right, bottom = 66, 62, 154, 72 + profile_reserve
                     map_size = min(panel_width - left - right,
                                    self.height() - top - bottom)
                     if map_size <= 0:
@@ -243,12 +286,84 @@ class ContactMapCanvas:
                     painter.drawText(QtCore.QRectF(-map_size / 2, -10, map_size, 20),
                                      QtCore.Qt.AlignCenter, "Residue")
                     painter.restore()
-                    painter.drawText(QtCore.QRectF(plot.left(), self.height() - 30,
-                                                    map_size, 20),
+                    x_label_y = plot.bottom() + 42 if profile_visible else self.height() - 30
+                    painter.drawText(QtCore.QRectF(plot.left(), x_label_y, map_size, 20),
                                      QtCore.Qt.AlignCenter, "Residue")
 
                     self._paint_colorbar(painter, panel, plot, top)
+                    if profile_visible:
+                        self._paint_profile(painter, panel, plot)
                 painter.end()
+
+            def _paint_profile(self, painter, panel, plot):
+                values = np.asarray(panel["profile"], dtype=float)
+                finite = np.isfinite(values)
+                chart_top = plot.bottom() + 70
+                chart_bottom = self.height() - 42
+                chart = QtCore.QRectF(plot.left(), chart_top, plot.width(),
+                                      chart_bottom - chart_top)
+                if chart.height() < 45:
+                    return
+                painter.setPen(QtGui.QColor(35, 44, 46))
+                painter.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.DemiBold))
+                painter.drawText(QtCore.QRectF(chart.left(), chart_top - 23,
+                                                chart.width(), 20),
+                                 QtCore.Qt.AlignCenter, panel["profile_title"])
+                painter.setFont(QtGui.QFont("Segoe UI", 8))
+                if not np.any(finite):
+                    painter.drawText(chart, QtCore.Qt.AlignCenter,
+                                     "No eligible residue pairs")
+                    return
+
+                maximum = float(np.nanmax(values))
+                y_maximum = maximum if maximum > 0 else 1.0
+                painter.setPen(QtGui.QPen(QtGui.QColor(215, 222, 221), 1))
+                for fraction in (0.0, 0.5, 1.0):
+                    y = chart.bottom() - fraction * chart.height()
+                    painter.drawLine(QtCore.QPointF(chart.left(), y),
+                                     QtCore.QPointF(chart.right(), y))
+                    painter.setPen(QtGui.QColor(75, 84, 86))
+                    painter.drawText(QtCore.QRectF(chart.left() - 54, y - 9, 48, 18),
+                                     QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+                                     f"{y_maximum * fraction:.3g}")
+                    painter.setPen(QtGui.QPen(QtGui.QColor(215, 222, 221), 1))
+
+                painter.setPen(QtGui.QPen(QtGui.QColor(30, 112, 124), 2))
+                path = QtGui.QPainterPath()
+                drawing = False
+                count = len(values)
+                for index, value in enumerate(values):
+                    if not np.isfinite(value):
+                        drawing = False
+                        continue
+                    x = (chart.left() + index * chart.width() / max(1, count - 1))
+                    y = chart.bottom() - (value / y_maximum) * chart.height()
+                    point = QtCore.QPointF(x, y)
+                    if drawing:
+                        path.lineTo(point)
+                    else:
+                        path.moveTo(point)
+                        drawing = True
+                painter.drawPath(path)
+
+                tick_count = min(6, count)
+                ticks = np.unique(np.linspace(0, count - 1, tick_count, dtype=int))
+                painter.setPen(QtGui.QColor(70, 79, 81))
+                for index in ticks:
+                    x = (chart.left() + index * chart.width() / max(1, count - 1))
+                    painter.drawLine(QtCore.QPointF(x, chart.bottom()),
+                                     QtCore.QPointF(x, chart.bottom() + 4))
+                    painter.drawText(QtCore.QRectF(x - 34, chart.bottom() + 5, 68, 18),
+                                     QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop,
+                                     panel["labels"][index])
+
+                painter.save()
+                painter.translate(chart.left() - 48, chart.center().y())
+                painter.rotate(-90)
+                painter.drawText(QtCore.QRectF(-chart.height() / 2, -10,
+                                                chart.height(), 18),
+                                 QtCore.Qt.AlignCenter, panel["profile_ylabel"])
+                painter.restore()
 
             def _paint_colorbar(self, painter, panel, plot, top):
                 x = plot.right() + 14
@@ -257,12 +372,12 @@ class ContactMapCanvas:
                     scale_height = max(70, half_height - 86)
                     self._paint_scale(
                         painter, x, top + 8, scale_height,
-                        panel["maximum"], panel["scale_mode"], "Mean distance (A)",
+                        panel["maximum"], panel["mean_scale_mode"], "Mean distance (A)",
                         panel["mean_summary"],
                     )
                     self._paint_scale(
                         painter, x, top + half_height + 12, scale_height,
-                        panel["std_maximum"], panel["scale_mode"], "Distance SD (A)",
+                        panel["std_maximum"], panel["std_scale_mode"], "Distance SD (A)",
                         panel["std_summary"],
                     )
                 else:
@@ -383,7 +498,8 @@ class ContactMapWindow:
                 self.plot_mode.addItem("Split mean / SD across diagonal", "split")
                 view_controls.addWidget(self.plot_mode)
                 view_controls.addSpacing(18)
-                view_controls.addWidget(QtWidgets.QLabel("Color scale", self))
+                self.global_scale_label = QtWidgets.QLabel("Color scale", self)
+                view_controls.addWidget(self.global_scale_label)
                 self.log_scale_button = QtWidgets.QToolButton(self)
                 self.log_scale_button.setText("Log")
                 self.log_scale_button.setCheckable(True)
@@ -402,7 +518,8 @@ class ContactMapWindow:
                 self.auto_max_check = QtWidgets.QCheckBox("Auto max", self)
                 self.auto_max_check.setChecked(True)
                 view_controls.addWidget(self.auto_max_check)
-                view_controls.addWidget(QtWidgets.QLabel("Max (A)", self))
+                self.global_max_label = QtWidgets.QLabel("Max (A)", self)
+                view_controls.addWidget(self.global_max_label)
                 self.max_range_spin = QtWidgets.QDoubleSpinBox(self)
                 self.max_range_spin.setRange(0.1, 10000.0)
                 self.max_range_spin.setSingleStep(1.0)
@@ -413,6 +530,29 @@ class ContactMapWindow:
                 view_controls.addWidget(self.max_range_spin)
                 view_controls.addStretch(1)
                 layout.addLayout(view_controls)
+
+                profile_controls = QtWidgets.QHBoxLayout()
+                self.profile_check = QtWidgets.QCheckBox(
+                    "Show per-residue column average below heatmap", self)
+                self.profile_check.setEnabled(False)
+                profile_controls.addWidget(self.profile_check)
+                self.export_csv_button = QtWidgets.QPushButton("Export raw CSV…", self)
+                self.export_csv_button.setEnabled(False)
+                profile_controls.addWidget(self.export_csv_button)
+                profile_controls.addStretch(1)
+                layout.addLayout(profile_controls)
+
+                self.split_scale_row = QtWidgets.QWidget(self)
+                split_scale_layout = QtWidgets.QHBoxLayout(self.split_scale_row)
+                split_scale_layout.setContentsMargins(0, 0, 0, 0)
+                self.mean_split_controls = self._create_split_scale_controls(
+                    "Mean distance (upper triangle)")
+                self.std_split_controls = self._create_split_scale_controls(
+                    "Standard deviation (lower triangle)")
+                split_scale_layout.addWidget(self.mean_split_controls["group"])
+                split_scale_layout.addWidget(self.std_split_controls["group"])
+                self.split_scale_row.hide()
+                layout.addWidget(self.split_scale_row)
 
                 self.frame_label = QtWidgets.QLabel("Frame: -", self)
                 layout.addWidget(self.frame_label)
@@ -431,6 +571,15 @@ class ContactMapWindow:
                 self.linear_scale_button.toggled.connect(self._scale_button_changed)
                 self.auto_max_check.toggled.connect(self._toggle_auto_max)
                 self.max_range_spin.valueChanged.connect(self._settings_changed)
+                self.profile_check.toggled.connect(self._settings_changed)
+                self.export_csv_button.clicked.connect(self.export_raw_csv)
+                for scale_controls in (self.mean_split_controls, self.std_split_controls):
+                    scale_controls["log"].toggled.connect(self._split_scale_changed)
+                    scale_controls["linear"].toggled.connect(self._split_scale_changed)
+                    scale_controls["auto"].toggled.connect(
+                        lambda checked, controls=scale_controls: self._toggle_split_auto(
+                            controls, checked))
+                    scale_controls["maximum"].valueChanged.connect(self._settings_changed)
                 self.save_button.clicked.connect(self.save_plot)
 
                 self.timer = QtCore.QTimer(self)
@@ -438,6 +587,38 @@ class ContactMapWindow:
                 self.timer.timeout.connect(self.refresh_if_needed)
                 self.refresh_objects()
                 self.timer.start()
+
+            def _create_split_scale_controls(self, title):
+                group = QtWidgets.QGroupBox(title, self)
+                controls = QtWidgets.QHBoxLayout(group)
+                log_button = QtWidgets.QRadioButton("Log", group)
+                log_button.setChecked(True)
+                linear_button = QtWidgets.QRadioButton("Linear", group)
+                scale_group = QtWidgets.QButtonGroup(group)
+                scale_group.setExclusive(True)
+                scale_group.addButton(log_button)
+                scale_group.addButton(linear_button)
+                auto_check = QtWidgets.QCheckBox("Auto max", group)
+                auto_check.setChecked(True)
+                maximum_spin = QtWidgets.QDoubleSpinBox(group)
+                maximum_spin.setRange(0.1, 10000.0)
+                maximum_spin.setSingleStep(1.0)
+                maximum_spin.setDecimals(2)
+                maximum_spin.setValue(40.0)
+                maximum_spin.setSuffix(" A")
+                maximum_spin.setEnabled(False)
+                maximum_spin.setFixedWidth(90)
+                controls.addWidget(log_button)
+                controls.addWidget(linear_button)
+                controls.addWidget(auto_check)
+                controls.addWidget(maximum_spin)
+                return {
+                    "group": group,
+                    "log": log_button,
+                    "linear": linear_button,
+                    "auto": auto_check,
+                    "maximum": maximum_spin,
+                }
 
             def refresh_objects(self):
                 previous = self.object_combo.currentText()
@@ -471,8 +652,18 @@ class ContactMapWindow:
                     self._last_key = None
                     self.update_contact_map()
 
+            def _split_scale_changed(self, checked):
+                if checked:
+                    self._last_key = None
+                    self.update_contact_map()
+
             def _toggle_auto_max(self, auto_max):
                 self.max_range_spin.setEnabled(not auto_max)
+                self._last_key = None
+                self.update_contact_map()
+
+            def _toggle_split_auto(self, controls, auto_max):
+                controls["maximum"].setEnabled(not auto_max)
                 self._last_key = None
                 self.update_contact_map()
 
@@ -483,13 +674,32 @@ class ContactMapWindow:
                 max_value = None if self.auto_max_check.isChecked() else self.max_range_spin.value()
                 return scale_mode, max_value
 
+            def _split_scale_settings(self):
+                settings = {}
+                for key, controls in (("mean", self.mean_split_controls),
+                                      ("std", self.std_split_controls)):
+                    mode = "log" if controls["log"].isChecked() else "linear"
+                    maximum = (None if controls["auto"].isChecked()
+                               else controls["maximum"].value())
+                    settings[key] = (mode, maximum)
+                return settings
+
             def _update_control_states(self, mode):
                 contact_mode = mode == "contacts"
+                split_mode = mode == "split"
+                for widget in (self.global_scale_label, self.log_scale_button,
+                               self.linear_scale_button, self.auto_max_check,
+                               self.global_max_label, self.max_range_spin):
+                    widget.setVisible(not split_mode)
+                self.split_scale_row.setVisible(split_mode)
                 self.cutoff_spin.setEnabled(contact_mode)
                 distance_mode = not contact_mode
-                self.auto_max_check.setEnabled(distance_mode)
+                self.global_scale_label.setEnabled(not split_mode)
+                self.auto_max_check.setEnabled(distance_mode and not split_mode)
                 self.max_range_spin.setEnabled(
-                    distance_mode and not self.auto_max_check.isChecked())
+                    distance_mode and not split_mode and not self.auto_max_check.isChecked())
+                self.profile_check.setEnabled(mode in {"mean", "std"})
+                self.export_csv_button.setEnabled(mode in {"mean", "std"})
 
             def _frame_data(self, object_name, state):
                 model = cmd.get_model(
@@ -597,8 +807,11 @@ class ContactMapWindow:
                 state_count = max(1, int(cmd.count_states(object_name)))
                 frame_key = frame if mode in {"contacts", "frame_centers"} else None
                 scale_mode, max_value = self._scale_settings()
+                split_scale_settings = self._split_scale_settings() if mode == "split" else None
+                profile_key = self.profile_check.isChecked() if mode in {"mean", "std"} else False
                 key = (object_name, frame_key, state_count, self.cutoff_spin.value(),
-                       self.separation_spin.value(), mode, scale_mode, max_value)
+                      self.separation_spin.value(), mode, scale_mode, max_value,
+                      split_scale_settings, profile_key)
                 if key != self._last_key:
                     self.update_contact_map()
 
@@ -690,6 +903,9 @@ class ContactMapWindow:
                             "title": "Mean CA-pair distance",
                             "legend": "Mean distance (A)",
                             "summary": mean_summary,
+                            "profile": _column_profile(mean),
+                            "profile_title": "Mean distance by residue",
+                            "profile_ylabel": "Mean CA distance (A)",
                         }
                         sd_panel = {
                             "matrix": standard_deviation,
@@ -697,6 +913,9 @@ class ContactMapWindow:
                             "title": "Distance standard deviation",
                             "legend": "Distance SD (A)",
                             "summary": sd_summary,
+                            "profile": _column_profile(standard_deviation),
+                            "profile_title": "Mean pair SD by residue",
+                            "profile_ylabel": "Mean pair SD (A)",
                         }
                         if mode == "mean":
                             panels = [mean_panel]
@@ -725,11 +944,24 @@ class ContactMapWindow:
                             status = f"Mean distance and population SD across {state_count} frames"
                         self.frame_label.setText(f"Statistics: {state_count} frames")
 
-                    self.canvas.set_panels(panels, scale_mode, max_value)
+                    split_scale_settings = (
+                        self._split_scale_settings() if mode == "split" else None
+                    )
+                    show_profile = (
+                        self.profile_check.isChecked() and mode in {"mean", "std"}
+                    )
+                    self.canvas.set_panels(
+                        panels, scale_mode, max_value,
+                        split_scale_settings=split_scale_settings,
+                        show_profile=show_profile,
+                    )
                     self.status_label.setText(status)
                     frame_key = frame if mode in {"contacts", "frame_centers"} else None
                     self._last_key = (object_name, frame_key, state_count, cutoff,
-                                      separation, mode, scale_mode, max_value)
+                                      separation, mode, scale_mode, max_value,
+                                      split_scale_settings,
+                                      self.profile_check.isChecked()
+                                      if mode in {"mean", "std"} else False)
                 except Exception as exc:
                     self.status_label.setText(f"Could not update contact map: {exc}")
                     self.canvas.set_message("Contact map update failed; see status below.")
@@ -770,6 +1002,33 @@ class ContactMapWindow:
                     self.status_label.setText(f"Could not save plot: {path}")
                     return
                 self.status_label.setText(f"Saved plot: {path}")
+
+            def export_raw_csv(self):
+                mode = self.plot_mode.currentData()
+                if mode not in {"mean", "std"} or not self.canvas._panels:
+                    self.status_label.setText(
+                        "Raw matrix CSV export is available for Mean distance and "
+                        "Distance standard deviation."
+                    )
+                    return
+                object_name = self.object_combo.currentText() or "protein"
+                suffix = "mean_distance" if mode == "mean" else "distance_standard_deviation"
+                default_path = f"{re.sub(r'[^A-Za-z0-9_-]', '_', object_name)}_{suffix}.csv"
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self, "Export raw distance matrix", default_path,
+                    "CSV file (*.csv)",
+                )
+                if not path:
+                    return
+                if not Path(path).suffix:
+                    path += ".csv"
+                try:
+                    panel = self.canvas._panels[0]
+                    _write_matrix_csv(path, panel["matrix"], panel["labels"])
+                except Exception as exc:
+                    self.status_label.setText(f"Could not export CSV: {exc}")
+                    return
+                self.status_label.setText(f"Saved raw matrix CSV: {path}")
 
         return Window()
 

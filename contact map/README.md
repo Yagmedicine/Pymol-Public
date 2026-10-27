@@ -1,6 +1,6 @@
 # PyMOL Contact Map Plugin
 
-**Version 1.4.0**  
+**Version 1.6.0**
 **Purpose:** inspect residue contacts and residue-pair distances for structures and trajectories loaded in PyMOL.
 
 The plugin opens a separate window inside your PyMOL session. It reads the selected molecular object, updates as you change frames, and can save the displayed plot as an image. It does not alter the molecule's coordinates or write changes to your structure or trajectory files.
@@ -23,6 +23,10 @@ Choose a view from the **Plot** menu in the plugin window:
 | **Split mean / SD across diagonal** | Mean distance in the upper triangle; standard deviation in the lower triangle. The diagonal shows the zero mean self-distance. Each triangle has its own colorbar when **Auto max** is selected. | All states/frames in the selected object. |
 
 The **mean distance** is not a residue-center distance or a closest-atom distance: it is the mean of CA-to-CA distances for each residue pair across frames. The **current frame residue-center distances** option is the one that uses geometric residue centers. The plugin does not currently calculate minimum atom-to-atom distances between residue surfaces.
+
+When **Mean distance** or **Distance standard deviation** is selected, the **Export raw CSV…** button can save the numeric matrix currently shown by that plot. Export is optional and is not available in other plot modes.
+
+For **Mean distance** and **Distance standard deviation**, the optional **Show per-residue column average below heatmap** checkbox adds a line plot beneath the matrix. Each x position is one residue; its y value is the average of the eligible values in that residue's matrix column. The mean view therefore plots the average of that residue's mean CA-pair distances; the SD view plots the average of its pairwise distance SDs. The diagonal and neighbor-filtered NaN cells are excluded. Because the matrices are symmetric, row-wise and column-wise averages are equivalent.
 
 ## Install and Open
 
@@ -87,11 +91,13 @@ Follow these steps once the data is loaded in PyMOL and the **Protein Contact Ma
 7. **Move through the trajectory.** Drag PyMOL's frame slider or press Play. Current-frame plots refresh from the visible PyMOL frame about every 350 ms. Pause playback before saving if you want a specific frame image.
 8. **Calculate a trajectory mean.** Choose **Mean distance** to display one mean CA-to-CA distance per residue pair, calculated over every state in the selected object. The status line reports the overall mean and overall population SD among eligible pairs.
 9. **Inspect variability.** Choose **Distance standard deviation** to display the population SD of each pair's CA-to-CA distance across states. Higher values identify pairs whose separation varies more over the trajectory.
-10. **Compare mean and variability side by side.** Choose **Mean + standard deviation** to place the two aggregate matrices next to one another. Each panel has its own legend.
-11. **Compare both statistics in one matrix.** Choose **Split mean / SD across diagonal**. Read the upper triangle as mean distance and the lower triangle as distance SD. This is an optional compact presentation; use the side-by-side mode if you prefer two complete matrices.
-12. **Choose Log or Linear coloring.** The square **Log** and **Linear** buttons control how numeric values map to viridis colors. Log is useful when many distances are small but a few are large. Linear allocates color evenly across the range.
-13. **Choose the color maximum.** Leave **Auto max** checked to scale to the largest finite value. To compare plots using the same colors, uncheck **Auto max** and enter a fixed **Max (A)**. Values above the fixed maximum are clipped to the maximum color. In split mode, a fixed maximum is shared by the mean and SD panels; Auto max gives each triangle its own range.
-14. **Save the image.** Click **Save plot…**, choose a destination and filename, then select PNG or JPEG. The saved image contains the currently displayed plot, labels, colorbars, and summaries. It is rendered at twice the window's on-screen pixel dimensions. Saving an image does not export the underlying numeric matrix as CSV.
+10. **Add a per-residue profile if useful.** In **Mean distance** or **Distance standard deviation**, check **Show per-residue column average below heatmap**. The line plot appears below the matrix. Its x-axis follows the residue order and its y-axis is the average of the eligible matrix-column values for that residue. Uncheck the box to restore the full-height heatmap.
+11. **Compare mean and variability side by side.** Choose **Mean + standard deviation** to place the two aggregate matrices next to one another. Each panel has its own legend.
+12. **Compare both statistics in one matrix.** Choose **Split mean / SD across diagonal**. Read the upper triangle as mean distance and the lower triangle as distance SD.
+13. **Set each split-half scale independently.** In split mode, use the **Mean distance (upper triangle)** and **Standard deviation (lower triangle)** groups. Each group has separate Log/Linear options, an **Auto max** checkbox, and a fixed maximum field. For example, set Mean to Log with Auto max off at `20 A`, and SD to Linear with Auto max off at `3 A`. The two legends show their respective scales. Use Auto max independently in either group when that half should use its own data maximum.
+14. **Set the general color scale for other plots.** Outside split mode, the square **Log** and **Linear** buttons apply to the displayed matrix. Leave **Auto max** checked to use its maximum finite value, or uncheck it and enter **Max (A)**. Values above a fixed maximum are clipped to the maximum color.
+15. **Export the raw matrix (optional).** Choose **Mean distance** or **Distance standard deviation**, then click **Export raw CSV…** and choose a filename. The CSV contains the numeric matrix shown in the heatmap, not an image or per-frame coordinate dump. It includes row/column residue labels, values in Angstroms, and `NA` for diagonal or neighbor-filtered pairs. If the per-residue profile is enabled, it is not added as a separate CSV column.
+16. **Save the image (optional).** Click **Save plot…**, choose a destination and filename, then select PNG or JPEG. The saved image contains the currently displayed plot, labels, colorbars, summaries, and optional per-residue profile. It is rendered at twice the window's on-screen pixel dimensions. Image export and CSV export are separate actions.
 
 The plugin does not change PyMOL coordinates, rotate the structure, or modify source files. Aggregate statistics are computed over all states of the selected object and cached for reuse. Choosing another object or changing the neighbor exclusion causes the aggregate values to be recalculated.
 
@@ -140,7 +146,7 @@ Both scale modes start at zero and map the selected maximum to the final viridis
 - **Log** uses the zero-safe transform $\log(1+x)/\log(1+x_{\max})$. This expands color differences among small values while keeping zero valid.
 - **Linear** uses $x/x_{\max}$, spreading colors evenly across the selected range.
 - **Auto max** uses the maximum finite value in the plotted matrix. In split mode, each triangle gets its own automatic maximum.
-- A fixed **Max (A)** applies to both halves of the split plot, which makes them directly comparable. A residue-center/CA distance above that value uses the maximum color.
+- Outside split mode, a fixed **Max (A)** applies to the displayed distance matrix. In split mode, the Mean and SD groups each select their own Auto max or fixed maximum, scale mode, and cutoff. A value above its half's fixed maximum uses the maximum color.
 - In the binary cutoff-contact view, the color range is fixed at 0 to 1; the distance max field is disabled.
 
 White cells indicate omitted pairs (diagonal or excluded same-chain neighbors). For distance matrices, a genuine zero value is colored with the first viridis color rather than white.
@@ -156,6 +162,10 @@ White cells indicate omitted pairs (diagonal or excluded same-chain neighbors). 
 | Color scale | Log | All views |
 | Auto max | On | Distance plots; cutoff contacts always use 0-1 |
 | Max (A) | `40.00` when enabled | Distance plots with Auto max off |
+| Show per-residue column average | Off | Mean distance and distance SD |
+| Split Mean scale | Log, Auto max | Upper triangle in split mode |
+| Split SD scale | Log, Auto max | Lower triangle in split mode |
+| Export raw CSV… | Available | Mean distance and distance SD only |
 
 ## Requirements and Limitations
 
@@ -176,6 +186,8 @@ White cells indicate omitted pairs (diagonal or excluded same-chain neighbors). 
 | **1.2.0** | Corrected aggregate plots to mean CA-pair distance and distance SD; added the optional split-diagonal view and zero-based logarithmic color mapping. |
 | **1.3.0** | Added square Log/Linear controls, Auto max, and a user-set maximum range with clipping. |
 | **1.4.0** | Separated the current-frame cutoff contact map from a new current-frame residue-center distance map based on geometric centers of non-hydrogen protein atoms. |
+| **1.5.0** | Added optional per-residue column-average profiles below mean and SD heatmaps, plus independent scale mode and maximum controls for each split-diagonal half. |
+| **1.6.0** | Added optional labeled CSV export for Mean distance and Distance standard deviation matrices. Excluded/filtered matrix entries are represented as `NA`. |
 
 ## Troubleshooting
 
