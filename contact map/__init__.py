@@ -1,6 +1,6 @@
 """Contact Map: display a live CA-residue contact map for a PyMOL object.
 
-Version: v5
+Version: v6
 Purpose:
     Open a separate Qt window showing current-frame cutoff contacts or
     residue-center distances, plus mean pairwise distances and standard
@@ -26,6 +26,7 @@ from pathlib import Path
 import re
 import csv
 import tempfile
+import shutil
 
 import numpy as np
 
@@ -225,7 +226,7 @@ def _statistics_display(mean, standard_deviation, settings):
                  "profile": _column_profile(mean, mean_minimum, mean_maximum)},
         "std": {"pixels": sd_pixels, "minimum": sd_minimum,
                 "maximum": sd_maximum, "scale_mode": sd_mode,
-                "profile": _column_profile(filtered_sd, sd_minimum, sd_maximum)},
+                "profile": _column_profile(filtered_sd)},
     }
 
 
@@ -236,6 +237,72 @@ def _format_scale_value(value):
 def _load_qt():
     from pymol.Qt import QtCore, QtGui, QtWidgets
     return QtCore, QtGui, QtWidgets
+
+
+class ContactMapRangeSlider:
+    def __new__(cls, *args, **kwargs):
+        QtCore, QtGui, QtWidgets = _load_qt()
+
+        class RangeSlider(QtWidgets.QWidget):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.minimum = 0.0
+                self.maximum = 1.0
+                self.domain = 1.0
+                self.scale_mode = "linear"
+                self.active_handle = None
+                self.on_change = None
+                self.setCursor(QtCore.Qt.SizeVerCursor)
+                self.setToolTip("Drag the upper or lower cutoff handle along the colorbar")
+
+            def set_range(self, minimum, maximum, domain, scale_mode):
+                self.minimum, self.maximum = minimum, maximum
+                self.domain = max(domain, maximum, minimum, 0.01)
+                self.scale_mode = scale_mode
+                self.update()
+
+            def position(self, value):
+                fraction = (np.log1p(value) / np.log1p(self.domain)
+                            if self.scale_mode == "log" else value / self.domain)
+                return (1.0 - fraction) * max(1, self.height() - 1)
+
+            def paintEvent(self, event):
+                painter = QtGui.QPainter(self)
+                for value in (self.minimum, self.maximum):
+                    position = self.position(value)
+                    painter.setPen(QtGui.QPen(QtGui.QColor("white"), 5))
+                    painter.drawLine(QtCore.QPointF(0, position), QtCore.QPointF(self.width(), position))
+                    painter.setPen(QtGui.QPen(QtGui.QColor(30, 40, 42), 2))
+                    painter.drawLine(QtCore.QPointF(0, position), QtCore.QPointF(self.width(), position))
+                painter.end()
+
+            def mousePressEvent(self, event):
+                if event.button() == QtCore.Qt.LeftButton:
+                    self.active_handle = min(("maximum", "minimum"),
+                        key=lambda name: abs(event.pos().y() - self.position(getattr(self, name))))
+                    self._drag(event.pos().y())
+
+            def mouseMoveEvent(self, event):
+                if self.active_handle:
+                    self._drag(event.pos().y())
+
+            def mouseReleaseEvent(self, event):
+                if self.active_handle:
+                    self._drag(event.pos().y())
+                    self.active_handle = None
+
+            def _drag(self, position):
+                fraction = float(np.clip(1.0 - position / max(1, self.height() - 1), 0, 1))
+                value = (float(np.expm1(fraction * np.log1p(self.domain)))
+                         if self.scale_mode == "log" else fraction * self.domain)
+                value = min(value, self.maximum) if self.active_handle == "minimum" else max(value, self.minimum)
+                value = round(value, 2)
+                if self.active_handle == "minimum":
+                    value = min(value, float(np.floor(self.maximum * 100) / 100))
+                if self.on_change:
+                    self.on_change(self.active_handle, value)
+
+        return RangeSlider(*args, **kwargs)
 
 
 class ContactMapCanvas:
@@ -326,8 +393,11 @@ class ContactMapCanvas:
                         "show_right_profile": bool(panel.get("show_right_profile", False)),
                     })
                 self._panels = rendered_panels
-                self.setMinimumHeight(540 if any(
-                    panel["show_profile"] or panel["show_right_profile"] for panel in rendered_panels) else 480)
+                profiles_visible = any(panel["show_profile"] or panel["show_right_profile"]
+                                       for panel in rendered_panels)
+                self.setMinimumHeight(800 if profiles_visible else 480)
+                self.setMinimumWidth(1200 if len(rendered_panels) > 1 else
+                                     1000 if any(panel["show_right_profile"] for panel in rendered_panels) else 760)
                 self.update()
 
             def set_message(self, message):
@@ -352,8 +422,8 @@ class ContactMapCanvas:
                 for panel_index, panel in enumerate(self._panels):
                     panel_left = panel_index * panel_width
                     profile_visible = panel["show_profile"]
-                    profile_reserve = 200 if profile_visible else 0
-                    right_reserve = 235 if panel["show_right_profile"] else 0
+                    profile_reserve = 330 if profile_visible else 0
+                    right_reserve = 320 if panel["show_right_profile"] else 0
                     left, top, right, bottom = 76, 88, 170 + right_reserve, 72 + profile_reserve
                     map_size = min(panel_width - left - right,
                                    self.height() - top - bottom)
@@ -412,13 +482,18 @@ class ContactMapCanvas:
                 for key, controls in self.scale_controls.items():
                     controls["group"].setVisible(key in self._used_scale_controls and not self.export_render)
 
+            def _profile_rect(self, panel, plot):
+                chart_top = plot.bottom() + 70
+                chart_bottom = self.height() - 60
+                chart_width = (plot.width() + (300 if panel["show_right_profile"] else 0)
+                               if panel.get("split") else self.width() / len(self._panels) - 116)
+                return QtCore.QRectF(plot.left(), chart_top, chart_width, chart_bottom - chart_top)
+
             def _paint_profile(self, painter, panel, plot):
                 values = np.asarray(panel["profile"], dtype=float)
                 finite = np.isfinite(values)
-                chart_top = plot.bottom() + 100
-                chart_bottom = self.height() - 60
-                chart = QtCore.QRectF(plot.left(), chart_top, plot.width(),
-                                      chart_bottom - chart_top)
+                chart = self._profile_rect(panel, plot)
+                chart_top = chart.top()
                 if chart.height() < 45:
                     return
                 painter.setPen(QtGui.QColor(35, 44, 46))
@@ -462,11 +537,6 @@ class ContactMapCanvas:
                         path.moveTo(point)
                         drawing = True
                 painter.drawPath(path)
-                for index, value in enumerate(values):
-                    if np.isfinite(value):
-                        x = chart.left() + index * chart.width() / max(1, count - 1)
-                        y = chart.bottom() - value / y_maximum * chart.height()
-                        painter.drawEllipse(QtCore.QPointF(x, y), 2, 2)
 
                 tick_count = min(6, count, max(2, int(chart.width() / 85) + 1))
                 ticks = np.unique(np.linspace(0, count - 1, tick_count, dtype=int))
@@ -493,7 +563,7 @@ class ContactMapCanvas:
 
             def _paint_right_profile(self, painter, panel, plot):
                 values = np.asarray(panel["right_profile"], dtype=float)
-                chart = QtCore.QRectF(plot.right() + 24, plot.top(), 165, plot.height())
+                chart = QtCore.QRectF(plot.right() + 24, plot.top(), 230, plot.height())
                 finite = np.isfinite(values)
                 painter.setPen(QtGui.QColor(45, 54, 56))
                 painter.drawText(QtCore.QRectF(chart.left() - 3, chart.top() - 40,
@@ -527,7 +597,6 @@ class ContactMapCanvas:
                     else:
                         path.moveTo(point)
                     drawing = True
-                    painter.drawEllipse(point, 2, 2)
                 painter.drawPath(path)
                 painter.setPen(QtGui.QColor(55, 65, 67))
                 painter.drawText(QtCore.QRectF(chart.left(), chart.bottom() + 28, chart.width(), 20),
@@ -538,7 +607,12 @@ class ContactMapCanvas:
                                      QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, panel["labels"][index])
 
             def _paint_colorbar(self, painter, panel, plot, top):
-                x = plot.right() + (250 if panel["show_right_profile"] else 14)
+                x = plot.right() + (335 if panel["show_right_profile"] else 14)
+                def domain_for(key):
+                    matrix = np.asarray(panel.get("std_matrix" if key == "std" else "mean_matrix",
+                                                  panel["matrix"]), dtype=float)
+                    finite = matrix[np.isfinite(matrix)]
+                    return float(finite.max()) if finite.size else 0.0
                 if panel.get("binary"):
                     self._paint_binary_scale(painter, x, top + 8, max(100, plot.height() - 150), panel)
                 elif panel.get("split"):
@@ -547,22 +621,23 @@ class ContactMapCanvas:
                     self._paint_scale(
                         painter, x, top + 8, scale_height,
                         panel["minimum"], panel["maximum"], panel["mean_scale_mode"], "Mean distance (A)",
-                        panel["mean_summary"], "mean",
+                        panel["mean_summary"], "mean", domain_for("mean"),
                     )
                     self._paint_scale(
                         painter, x, top + half_height + 12, scale_height,
                         panel["std_minimum"], panel["std_maximum"], panel["std_scale_mode"], "Distance SD (A)",
-                        panel["std_summary"], "std",
+                        panel["std_summary"], "std", domain_for("std"),
                     )
                 else:
                     self._paint_scale(
                         painter, x, top + 8, max(75, plot.height() - 200),
                         panel["minimum"], panel["maximum"], panel["scale_mode"],
                             panel["legend"], panel["summary"], panel.get("statistic", "frame"),
+                            domain_for(panel.get("statistic")) if panel.get("statistic") else None,
                     )
 
             def _paint_scale(self, painter, x, y, bar_height, minimum, maximum,
-                                scale_mode, title, summary, control_key):
+                                scale_mode, title, summary, control_key, domain=None):
                 bar_width = 16
                 painter.setPen(QtGui.QColor(55, 65, 67))
                 scale_label = f"{title}\n{scale_mode.capitalize()} scale"
@@ -575,13 +650,25 @@ class ContactMapCanvas:
                                      "No valid distances")
                     return
 
-                if maximum == minimum:
+                full_domain = max(domain, maximum, minimum) if domain is not None else None
+
+                if maximum == minimum and (full_domain is None or full_domain == 0):
                     color = QtGui.QColor(*np.rint(_VIRIDIS_STOPS[0] * 255).astype(int))
                     painter.fillRect(QtCore.QRectF(x, bar_top, bar_width, bar_height), color)
                 else:
                     gradient_steps = min(160, max(40, int(bar_height)))
                     for step in range(gradient_steps):
                         fraction = 1.0 - step / max(1, gradient_steps - 1)
+                        if full_domain is not None:
+                            value = (np.expm1(fraction * np.log1p(full_domain))
+                                     if scale_mode == "log" else fraction * full_domain)
+                            fraction = ((np.log1p(value) - np.log1p(minimum)) /
+                                        max(np.log1p(maximum) - np.log1p(minimum), 1e-12)
+                                        if scale_mode == "log" else
+                                        (value - minimum) / max(maximum - minimum, 1e-12))
+                        else:
+                            value = minimum + fraction * (maximum - minimum)
+                        fraction = float(np.clip(fraction, 0, 1))
                         palette_position = fraction * (len(_VIRIDIS_STOPS) - 1)
                         lower = int(np.floor(palette_position))
                         upper = min(lower + 1, len(_VIRIDIS_STOPS) - 1)
@@ -589,6 +676,10 @@ class ContactMapCanvas:
                         color_values = (_VIRIDIS_STOPS[lower] * (1 - blend)
                                         + _VIRIDIS_STOPS[upper] * blend)
                         color = QtGui.QColor(*(np.rint(color_values * 255).astype(int)))
+                        if value < minimum:
+                            color = QtGui.QColor(80, 80, 80)
+                        elif value > maximum:
+                            color = QtGui.QColor(210, 210, 210)
                         y_position = bar_top + step * bar_height / gradient_steps
                         painter.fillRect(QtCore.QRectF(x, y_position, bar_width,
                                                        bar_height / gradient_steps + 1), color)
@@ -596,15 +687,28 @@ class ContactMapCanvas:
                 painter.drawRect(QtCore.QRectF(x, bar_top, bar_width, bar_height))
                 painter.setPen(QtGui.QColor(55, 65, 67))
                 ticks = ([] if minimum is None else list(np.expm1(np.linspace(
-                    np.log1p(minimum), np.log1p(maximum), 4))) if scale_mode == "log"
-                    else list(np.linspace(minimum, maximum, 4)))
+                    np.log1p(minimum), np.log1p(maximum), 3))) if scale_mode == "log"
+                    else list(np.linspace(minimum, maximum, 3)))
                 if minimum == maximum:
                     ticks = [minimum]
+                if full_domain is not None:
+                    ticks = [float(np.expm1(0.5 * np.log1p(full_domain)))
+                             if scale_mode == "log" else full_domain / 2]
+                    if self.export_render:
+                        for value, label, offset in ((maximum, "Upper", -12),
+                                                     (minimum, "Lower", bar_height - 12)):
+                            painter.drawText(QtCore.QRectF(x + bar_width + 7, bar_top + offset, 120, 24),
+                                             QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                                             f"{label}: {_format_scale_value(value)} A")
                 for value in ticks:
-                    if (not self.export_render and control_key in self.scale_controls
+                    if (full_domain is None and not self.export_render and control_key in self.scale_controls
                             and (np.isclose(value, minimum) or np.isclose(value, maximum))):
                         continue
-                    if maximum > minimum and scale_mode == "log":
+                    if full_domain is not None:
+                        position = ((np.log1p(value) / np.log1p(full_domain)
+                                     if scale_mode == "log" else value / full_domain)
+                                    if full_domain > 0 else 0.5)
+                    elif maximum > minimum and scale_mode == "log":
                         position = ((np.log1p(value) - np.log1p(minimum))
                                     / (np.log1p(maximum) - np.log1p(minimum)))
                     else:
@@ -629,9 +733,11 @@ class ContactMapCanvas:
                                  | QtCore.Qt.TextWordWrap,
                                  "\n".join(summary))
 
-                self._place_scale_controls(control_key, x, y, bar_height, maximum)
+                self._place_scale_controls(control_key, x, y, bar_height, maximum,
+                                           minimum, full_domain, scale_mode)
 
-            def _place_scale_controls(self, key, x, y, bar_height, maximum):
+            def _place_scale_controls(self, key, x, y, bar_height, maximum,
+                                      minimum, domain, scale_mode):
                 controls = self.scale_controls.get(key)
                 if controls is None or self.export_render:
                     return
@@ -642,14 +748,17 @@ class ContactMapCanvas:
                 controls["auto"].setGeometry(0, 55, 115, 22)
                 for name in ("log", "linear", "auto", "maximum"):
                     controls[name].show()
-                controls["maximum"].setGeometry(30, 73, 100, 25)
+                controls["maximum"].setGeometry(24, 73, controls["maximum"].width(), 25)
                 if controls["auto"].isChecked() and maximum is not None:
                     controls["maximum"].blockSignals(True)
                     controls["maximum"].setValue(maximum)
                     controls["maximum"].blockSignals(False)
                 if "minimum" in controls:
-                    controls["minimum"].setGeometry(30, int(73 + bar_height), 100, 25)
+                    controls["minimum"].setGeometry(24, int(73 + bar_height), controls["minimum"].width(), 25)
                     controls["minimum"].show()
+                    controls["range_slider"].setGeometry(-3, 85, 25, max(30, int(bar_height)))
+                    controls["range_slider"].set_range(minimum, maximum, domain, scale_mode)
+                    controls["range_slider"].show()
                 if key == "frame":
                     for name in ("cutoff", "cutoff_label", "slider"):
                         controls[name].hide()
@@ -935,6 +1044,13 @@ class ContactMapWindow:
                 maximum_spin.setFixedWidth(90)
                 minimum_spin.setToolTip("Lower colorbar bound in Angstroms")
                 maximum_spin.setToolTip("Upper colorbar bound in Angstroms")
+                minimum_spin.setFixedWidth(126)
+                maximum_spin.setFixedWidth(126)
+                minimum_spin.setPrefix("Lower: ")
+                maximum_spin.setPrefix("Upper: ")
+                range_slider = ContactMapRangeSlider(group)
+                controls = {"minimum": minimum_spin, "maximum": maximum_spin, "auto": auto_check}
+                range_slider.on_change = lambda name, value: self._range_handle_changed(controls, name, value)
                 return {
                     "group": group,
                     "log": log_button,
@@ -942,7 +1058,19 @@ class ContactMapWindow:
                     "auto": auto_check,
                     "minimum": minimum_spin,
                     "maximum": maximum_spin,
+                    "range_slider": range_slider,
                 }
+
+            def _range_handle_changed(self, controls, name, value):
+                if name == "maximum":
+                    controls["auto"].blockSignals(True)
+                    controls["auto"].setChecked(False)
+                    controls["auto"].blockSignals(False)
+                    controls["maximum"].setEnabled(True)
+                controls[name].blockSignals(True)
+                controls[name].setValue(value)
+                controls[name].blockSignals(False)
+                self._settings_changed(value)
 
             def refresh_objects(self):
                 previous = self.object_combo.currentText()
@@ -1437,7 +1565,9 @@ class ContactMapWindow:
                 try:
                     if dialog.exec_() != QtWidgets.QDialog.Accepted:
                         return
-                    folder = Path(destination.text()).expanduser()
+                    if not destination.text().strip():
+                        raise ValueError("Choose an export destination folder.")
+                    folder = Path(destination.text().strip()).expanduser()
                     if scope.currentData() == "frames":
                         result = self._export_frame_series(
                             folder, first.value(), last.value(), interval.value(),
@@ -1464,26 +1594,29 @@ class ContactMapWindow:
                 datasets = self._csv_datasets if datasets is None else datasets
                 if not save_image and not keys:
                     raise ValueError("Select a PNG plot and/or one or more CSV datasets.")
-                destination = Path(destination)
-                if not destination.is_dir():
-                    raise ValueError("Choose an existing destination folder.")
+                destination = Path(destination).expanduser()
+                destination.mkdir(parents=True, exist_ok=True)
                 if any(key not in datasets for key in keys):
                     raise ValueError("A selected CSV dataset is unavailable.")
                 if image_format not in {"png", "jpg"}:
                     raise ValueError("Choose PNG or JPEG output.")
+                if save_image and not self.canvas._panels:
+                    raise ValueError("Select a visible plot before saving an image.")
                 safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", self.object_combo.currentText())
                 output = Path(tempfile.mkdtemp(prefix=safe_name + "_export_", dir=str(destination)))
-                if save_image:
-                    if not self.canvas._panels:
-                        raise ValueError("Select a visible plot before saving a PNG.")
-                    self._save_canvas_image(output / (safe_name + "_plot." + image_format))
-                for key in keys:
-                    dataset = datasets[key]
-                    path = output / f"{safe_name}_{dataset['suffix']}.csv"
-                    if dataset.get("value_label"):
-                        _write_profile_csv(path, dataset["values"], dataset["labels"], dataset["value_label"])
-                    else:
-                        _write_matrix_csv(path, dataset["values"], dataset["labels"])
+                try:
+                    if save_image:
+                        self._save_canvas_image(output / (safe_name + "_plot." + image_format))
+                    for key in keys:
+                        dataset = datasets[key]
+                        path = output / f"{safe_name}_{dataset['suffix']}.csv"
+                        if dataset.get("value_label"):
+                            _write_profile_csv(path, dataset["values"], dataset["labels"], dataset["value_label"])
+                        else:
+                            _write_matrix_csv(path, dataset["values"], dataset["labels"])
+                except Exception:
+                    shutil.rmtree(output, ignore_errors=True)
+                    raise
                 return output
 
             def export_frames_dialog(self):
@@ -1565,9 +1698,8 @@ class ContactMapWindow:
                     raise ValueError(f"Choose a range between 1 and {count} and a positive interval.")
                 if not (save_images or save_csv):
                     raise ValueError("Select PNG plots, CSV matrices, or both.")
-                destination = Path(destination)
-                if not destination.is_dir():
-                    raise ValueError("Choose an existing destination folder.")
+                destination = Path(destination).expanduser()
+                destination.mkdir(parents=True, exist_ok=True)
                 mode = self.plot_mode.currentData()
                 metric = self.distance_metric.currentData()
                 cutoff, separation = self.cutoff_spin.value(), self.separation_spin.value()
@@ -1588,7 +1720,8 @@ class ContactMapWindow:
                 self.timer.stop()
                 locked = [widget for widget in self.findChildren(QtWidgets.QWidget)
                           if isinstance(widget, (QtWidgets.QAbstractButton, QtWidgets.QComboBox,
-                                                 QtWidgets.QAbstractSpinBox, QtWidgets.QLineEdit))]
+                                                 QtWidgets.QAbstractSpinBox, QtWidgets.QLineEdit,
+                                                 QtWidgets.QSlider)) or hasattr(widget, "on_change")]
                 enabled_states = [(widget, widget.isEnabled()) for widget in locked]
                 progress = QtWidgets.QProgressDialog("Preparing export", "Cancel", 0, len(states), self)
                 progress.setWindowTitle("Exporting frame plots and CSVs")
@@ -1648,25 +1781,28 @@ class ContactMapWindow:
 
             def _save_canvas_image(self, path):
                 scale = 2
+                snapshot = type(self.canvas)()
+                snapshot.setMinimumSize(0, 0)
+                snapshot.resize(self.canvas.size())
+                snapshot._panels = list(self.canvas._panels)
+                snapshot.export_render = True
                 image = QtGui.QImage(
-                    self.canvas.width() * scale, self.canvas.height() * scale,
+                    snapshot.width() * scale, snapshot.height() * scale,
                     QtGui.QImage.Format_ARGB32)
+                if image.isNull():
+                    snapshot.deleteLater()
+                    raise MemoryError("Not enough memory to render this plot. Reduce the plot window size and retry.")
                 image.setDevicePixelRatio(scale)
                 image.fill(QtGui.QColor("white"))
                 painter = QtGui.QPainter(image)
-                self.canvas.export_render = True
-                visible_controls = [(controls["group"], controls["group"].isVisible())
-                                    for controls in self.canvas.scale_controls.values()]
-                for group, _ in visible_controls:
-                    group.hide()
                 try:
-                    self.canvas.render(painter)
+                    if not painter.isActive():
+                        raise RuntimeError("Could not initialize the plot image renderer.")
+                    snapshot.render(painter, QtCore.QPoint(), QtGui.QRegion(),
+                                    QtWidgets.QWidget.DrawWindowBackground)
                 finally:
                     painter.end()
-                    self.canvas.export_render = False
-                    for group, visible in visible_controls:
-                        group.setVisible(visible)
-                    self.canvas.update()
+                    snapshot.deleteLater()
                 if not image.save(str(path)):
                     raise OSError(f"Could not save plot: {path}")
 

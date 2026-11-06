@@ -136,7 +136,7 @@ class ContactMapTests(unittest.TestCase):
         self.window.std_profile_check.setChecked(True)
         panels = self.window.canvas._panels
         np.testing.assert_allclose(panels[0]["profile"], [12., 12., np.nan], equal_nan=True)
-        np.testing.assert_allclose(panels[1]["profile"], [np.nan, np.nan, np.nan], equal_nan=True)
+        np.testing.assert_allclose(panels[1]["profile"], [2., 2., np.nan], equal_nan=True)
         self.select_mode("split")
         panel = self.window.canvas._panels[0]
         self.assertTrue(panel["show_profile"])
@@ -375,6 +375,12 @@ class ContactMapTests(unittest.TestCase):
         np.testing.assert_allclose(self.window.canvas._panels[1]["profile"], [2., 2., 2.])
         mean["maximum"].setValue(25.)
         np.testing.assert_allclose(self.window.canvas._panels[1]["profile"], [1., 2., 1.])
+        sd = self.window.std_split_controls
+        sd["auto"].setChecked(False)
+        sd["maximum"].setValue(1.)
+        sd["minimum"].setValue(0.5)
+        np.testing.assert_allclose(self.window.canvas._panels[1]["profile"], [1., 2., 1.])
+        np.testing.assert_allclose(self.window._csv_datasets["std_profile"]["values"], [1., 2., 1.])
         self.assertEqual(self.window._raw_matrices["mean"][0, 2], 20.)
 
     def test_v4_colorbar_widgets_single_export_and_binary_cutoff(self):
@@ -445,6 +451,91 @@ class ContactMapTests(unittest.TestCase):
             self.assertFalse(problems)
             frame_paths = list(Path(destination).glob("*/*frame_000002.csv"))
             self.assertEqual(len(frame_paths), 1)
+
+    def test_colorbar_handle_drags_preserve_sd_profile(self):
+        standalone = self.plugin.ContactMapRangeSlider()
+        standalone.resize(25, 100)
+        standalone.set_range(0., 1.275, 1.275, "linear")
+        changes = []
+        standalone.on_change = lambda name, value: changes.append((name, value))
+        standalone.active_handle = "minimum"
+        standalone._drag(0)
+        self.assertEqual(changes, [("minimum", 1.27)])
+        self.select_mode("both")
+        self.window.profile_check.setChecked(True)
+        self.window.std_profile_check.setChecked(True)
+        self.window.show()
+        self.application.processEvents()
+        for controls in (self.window.mean_split_controls, self.window.std_split_controls):
+            controls["linear"].setChecked(True)
+        self.application.processEvents()
+
+        def drag(controls, name, fraction):
+            slider = controls["range_slider"]
+            self.assertTrue(slider.isVisible())
+            start = QtCore.QPointF(10, slider.position(getattr(slider, name)))
+            end = QtCore.QPointF(10, (1 - fraction) * (slider.height() - 1))
+            for kind, position, button, buttons in (
+                    (QtCore.QEvent.MouseButtonPress, start, QtCore.Qt.LeftButton, QtCore.Qt.LeftButton),
+                    (QtCore.QEvent.MouseMove, end, QtCore.Qt.NoButton, QtCore.Qt.LeftButton),
+                    (QtCore.QEvent.MouseButtonRelease, end, QtCore.Qt.LeftButton, QtCore.Qt.NoButton)):
+                self.application.sendEvent(slider, QtGui.QMouseEvent(
+                    kind, position, button, buttons, QtCore.Qt.NoModifier))
+                self.application.processEvents()
+
+        mean = self.window.mean_split_controls
+        drag(mean, "maximum", 0.75)
+        drag(mean, "minimum", 0.5)
+        self.assertFalse(mean["auto"].isChecked())
+        self.assertAlmostEqual(mean["maximum"].value(), 15., delta=0.2)
+        self.assertAlmostEqual(mean["minimum"].value(), 10., delta=0.2)
+        original = self.window.canvas._panels[1]["profile"].copy()
+        sd = self.window.std_split_controls
+        drag(sd, "maximum", 0.5)
+        drag(sd, "minimum", 0.25)
+        np.testing.assert_allclose(self.window.canvas._panels[1]["profile"], original, equal_nan=True)
+        np.testing.assert_allclose(self.window._csv_datasets["std_profile"]["values"], original, equal_nan=True)
+        self.assertEqual(self.window.canvas._panels[1]["image"].pixelColor(1, 0).getRgb()[:3], (210, 210, 210))
+        self.assertGreaterEqual(self.window.canvas.width(), 1200)
+        self.assertGreaterEqual(self.window.canvas.height(), 800)
+        self.select_mode("split")
+        self.application.processEvents()
+        panel = self.window.canvas._panels[0]
+        plot = QtCore.QRectF(76, 88, 310, 310)
+        chart = self.window.canvas._profile_rect(panel, plot)
+        self.assertGreater(chart.width(), plot.width())
+        self.assertGreaterEqual(chart.height(), 200)
+        self.assertLess(chart.right(), plot.right() + 335)
+        self.window.profile_check.setChecked(False)
+        chart = self.window.canvas._profile_rect(self.window.canvas._panels[0], plot)
+        self.assertLess(chart.right(), plot.right() + 14)
+
+    def test_bundle_export_nested_destination_and_failed_write_cleanup(self):
+        self.select_mode("both")
+        self.window.profile_check.setChecked(True)
+        self.window.std_profile_check.setChecked(True)
+        self.window.show()
+        self.application.processEvents()
+        controls = self.window.mean_split_controls
+        geometry = controls["group"].geometry()
+        panels = self.window.canvas._panels
+        with tempfile.TemporaryDirectory() as destination:
+            nested = Path(destination) / "chosen folder" / "nested output"
+            with patch.object(self.window.canvas, "render", side_effect=AssertionError("live canvas rendered")):
+                output = self.window._export_current_bundle(nested, True, list(self.window._csv_datasets))
+            self.assertEqual(output.parent, nested)
+            image = QtGui.QImage(str(next(output.glob("*.png"))))
+            self.assertFalse(image.isNull())
+            self.assertEqual(image.width(), self.window.canvas.width() * 2)
+            self.assertEqual(image.height(), self.window.canvas.height() * 2)
+            self.assertEqual(len(list(output.glob("*.csv"))), len(self.window._csv_datasets))
+            self.assertIs(self.window.canvas._panels, panels)
+            self.assertEqual(controls["group"].geometry(), geometry)
+            self.assertTrue(controls["group"].isVisible())
+            with patch.object(self.plugin, "_write_matrix_csv", side_effect=OSError("disk write failure")):
+                with self.assertRaisesRegex(OSError, "disk write failure"):
+                    self.window._export_current_bundle(nested, True, ["mean"])
+            self.assertEqual(list(nested.iterdir()), [output])
 
     def test_v4_current_export_retains_jpeg_support(self):
         self.select_mode("both")

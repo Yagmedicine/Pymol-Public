@@ -37,7 +37,7 @@ Every heatmap shows its column residue labels along the **top** edge and row res
 
 The dedicated **Line plots** section contains **Show mean line plot** and **Show SD line plot**. Both are optional and initially unchecked. In the combined view each line plot appears below its own heatmap, with residues on the x-axis. The mean line's y-axis is **Mean of means (A)**: the average of eligible pairwise mean distances for that residue. The SD line's y-axis is **Mean of SDs (A)**: the average of eligible pairwise distance SDs, not an SD calculated from the mean line.
 
-In split mode the SD line is below the matrix, with residues on the x-axis; the mean line is to its right, with residue positions aligned vertically to the heatmap and mean distance on its horizontal axis. Profiles omit self-pairs and neighbor-filtered pairs. Mean profiles additionally honor the Mean range; SD profiles honor both the Mean pair-selection range and the SD range. A residue with no eligible partners has a gap rather than an artificial zero. Color scaling and gray exclusions never modify the raw matrices.
+In split mode the SD line is below the matrix, with residues on the x-axis; the mean line is to its right, with residue positions aligned vertically to the heatmap and mean distance on its horizontal axis. Profiles omit self-pairs and neighbor-filtered pairs. Both profiles honor the Mean pair-selection range. **SD's own cutoffs change its heatmap, not its line profile or profile CSV.** A residue with no eligible partners has a gap rather than an artificial zero. Lines have no circle markers and use larger plotting areas; split profiles stay clear of the colorbar column. Color scaling and gray exclusions never modify the raw matrices.
 
 Every plot mode now uses the single **Export…** button in the upper-right corner. Its popup offers the current view with any selected CSV datasets, or a range of loaded frames. There are no separate visible Save plot, Export CSV, or Export frames buttons. Matrix CSVs retain raw values; profile CSVs contain the range-filtered column averages used by the lines. See [Export Any Plot as CSV](#export-any-plot-as-csv) for the data formats.
 
@@ -46,6 +46,9 @@ Every plot mode now uses the single **Export…** button in the upper-right corn
 - Temporarily removed the closest-residue-distance dropdown option.
 - Residue centers average all loaded protein atoms, including any hydrogens present, in current-frame calculations, temporal statistics, and frame exports.
 - Column residue labels appear at the top of every heatmap, matching the left-axis order. Line-plot axes are unchanged.
+- Mean and SD colorbars each have draggable upper/lower cutoff handles, precise numeric fields, and a third value at the midpoint of the full scale. Moving the upper handle turns off Auto max; lower handles cannot cross upper handles. The full scale stays anchored to the data maximum, or a larger manually entered upper value.
+- SD line profiles respond only to Mean cutoffs, not SD cutoffs. Lines are marker-free, wider, and taller, with scrolling when needed.
+- Image exports use an off-screen snapshot instead of rendering live controls. Typed destination folders are created as needed; incomplete current-view bundles are removed on failure. PNG/JPEG and frame-series exports remain available.
 
 ## What's New in v4
 
@@ -119,11 +122,11 @@ Follow these steps once the data is loaded in PyMOL and the **Protein Contact Ma
 7. **Move through the trajectory.** Drag PyMOL's frame slider or press Play. Current-frame plots refresh from the visible PyMOL frame about every 350 ms. Pause playback before saving if you want a specific frame image.
 8. **Open statistics.** Choose **Mean + standard deviation**. Initially both **Show mean** and **Show standard deviation** are checked. Uncheck either to enlarge the other plot; if both are unchecked, the window asks you to select a statistic.
 9. **Choose the distance definition.** Select CA-to-CA or **Residue center to center (all atoms)**. Mean and SD both use that definition. The status line reports frame progress during the first calculation.
-10. **Choose ranges on the colorbars.** The numeric field at the top of each viridis bar sets its upper bound; the bottom field sets its lower bound. Uncheck **Auto max** to edit the upper field. For example, set Mean to `5-20 A` and SD to `0.5-3 A`. Boundaries are inclusive. Mean limits filter residue pairs in both maps; SD's own limits additionally filter SD. Limits must satisfy lower <= upper. If a range is invalid, the status line reports it and retains the last valid view so you can correct the fields.
-11. **Show line plots.** Check **Show mean line plot** and/or **Show SD line plot**. Both start off and can be toggled independently. In the combined view, keep the corresponding heatmap visible to see its line beneath it. The Mean line averages in-range pairwise means. The SD line averages pairwise SDs only for pairs passing both Mean and SD ranges. Exclusions do not contribute zeros. Both lines update immediately as you change limits; changing Log/Linear only changes heatmap colors. If a small window cannot show the full canvas, use the plot-area scrollbar.
+10. **Choose ranges on the colorbars.** Drag either horizontal cutoff handle directly along the Mean or SD colorbar. The Upper and Lower fields show precise cutoffs; a third value marks the full scale's midpoint (logarithmic midpoint in Log mode). Dragging the upper handle switches off **Auto max**. You can also uncheck Auto max and type the upper bound; the lower field stays editable. For example, set Mean to `5-20 A` and SD to `0.5-3 A`. Boundaries are inclusive. Mean limits filter pairs in both maps; SD limits additionally filter only SD heatmap colors. Handles cannot cross. Typed limits must satisfy lower <= upper; invalid input retains the last valid view and reports a status error.
+11. **Show line plots.** Check **Show mean line plot** and/or **Show SD line plot**. Both start off and can be toggled independently. In the combined view, keep the corresponding heatmap visible to see its line beneath it. The Mean line averages in-range pairwise means; the SD line averages pairwise SDs for pairs passing **Mean's range only**. Changing SD cutoffs does not change the SD line. Exclusions do not contribute zeros. Mean cutoff changes update both lines immediately; Log/Linear changes only heatmap colors. Lines have no point markers and use expanded plotting areas. If a small window cannot show the full canvas, use the plot-area scrollbars.
 12. **Compare both statistics in one matrix.** Choose **Split mean / SD across diagonal**. Read the upper triangle as mean distance and the lower triangle as distance SD.
 13. **Choose scales independently.** Choose Log or Linear beside each viridis bar. Mean may use Log while SD uses Linear. The same colorbar controls work in the combined and split layouts. In split mode enable the Mean line for the right-side plot and the SD line for the bottom plot.
-14. **Read the gray exclusions.** Below the Mean lower bound a pair is dark gray in both maps; above Mean's upper bound it is light gray in both. For other pairs, SD's own range determines its viridis/gray color. Structural exclusions remain white. Gray cells do not contribute to the respective line plots; raw matrix CSV values are unchanged.
+14. **Read the gray exclusions.** Below the Mean lower bound a pair is dark gray in both maps; above Mean's upper bound it is light gray in both. For other pairs, SD's own range determines its viridis/gray color. Structural exclusions remain white. Mean-excluded pairs do not contribute to either line; pairs gray only because of SD cutoffs still contribute to the SD line. Raw matrix CSV values are unchanged.
 15. **Export images and data.** Click the single upper-right **Export…** button. Keep **Current view and selected CSV datasets** for the displayed aggregate/frame plot. Choose a destination folder, optionally save a PNG/JPEG image, and check any combination of matrix/profile CSVs. Uncheck all CSVs for image-only output, or disable the image for CSV-only output. Click the dialog's **Export** button; it creates a uniquely named subfolder and reports its path.
 16. **Export frame numbers.** In that same popup, select **Selected frames**, enter First, Last, and Interval, and choose PNGs and/or matching frame CSVs. A statistics view exports per-frame distances under its selected distance definition, not repeated temporal Mean/SD images.
 
@@ -149,7 +152,7 @@ Frame exports from statistics views are **not repeated copies of the temporal me
 2. Select the starting plot mode from the table above. For statistics views, choose the desired distance definition first. For example, select **Mean + standard deviation**, then **Residue center to center (all atoms)**, to export residue-center distance maps for each frame.
 3. Configure the neighbor exclusion and color scale. Frame export from a current-frame mode uses that mode's global scale settings. Export from a statistics view uses the **Mean** scale, Min, and Auto/fixed Max settings; SD settings do not describe an individual-frame distance map.
 4. Click **Export…**, then choose **Selected frames** in the popup's Export dropdown.
-5. Click **Browse…** beside Destination and choose an existing writable folder, or enter its path.
+5. Click **Browse…** beside Destination and choose a writable folder, or enter a path. Missing destination folders are created automatically when permissions allow.
 6. Enter **First**, **Last (inclusive)**, and **Interval**. Numbering is one-based. For example, `1`, `10`, `2` exports `1, 3, 5, 7, 9`. These numbers refer to loaded PyMOL states, not original simulation timestamps.
 7. Leave both **Save PNG plot per frame** and **Save matching frame matrix CSVs** checked for paired output, or uncheck either for images-only/CSV-only output. At least one type is required. Frame-series images are PNG; the JPEG choice applies to Current view only.
 8. Click **Export**. A progress dialog shows the current frame and completed work; the PyMOL console also prints per-frame progress. Settings are temporarily disabled and playback is paused so each output corresponds to a stable calculation.
@@ -177,7 +180,7 @@ With **Auto max**, each image uses its own frame's maximum. Use a fixed Max if c
 
 1. Select the **Object** and the **Plot** mode. Wait until the calculation completes without an error.
 2. Set the current frame for a frame-based plot, or the distance definition and neighbor filter for a statistics plot.
-3. If exporting a line profile, first set the corresponding Mean or SD **Min/Max** range. Those limits determine which partners contribute to each exported column average.
+3. If exporting a line profile, first set the **Mean** cutoff range. That range determines which partners contribute to both exported profiles. SD cutoffs affect heatmap colors only.
 4. Click upper-right **Export…** and keep **Current view and selected CSV datasets**. The popup shows a checkbox list of datasets available for the current plot mode:
 
 | Plot mode | CSV choices |
@@ -223,7 +226,7 @@ A:ALA3,NA
 
 The Mean profile's value column is `column_mean_distance_angstrom`; the SD profile uses `column_mean_distance_sd_angstrom`. The SD profile is the average of eligible pairwise distance SDs, not the SD of the mean profile.
 
-Self-pairs and neighbor exclusions do not contribute. The Mean profile also excludes pairs outside Mean's range; the SD profile excludes pairs outside either Mean's or SD's range. `NA` means no eligible partners remain, not zero. Range changes affect exported profiles, while Log/Linear coloring and profile visibility do not.
+Self-pairs and neighbor exclusions do not contribute. Both profiles exclude pairs outside Mean's range. SD's own range does not filter its profile. `NA` means no eligible partners remain, not zero. Mean range changes affect exported profiles; SD range, Log/Linear coloring, and profile visibility do not.
 
 ### Filenames and reproducibility
 
@@ -267,11 +270,11 @@ $$
 
 The side summaries report the overall mean of the eligible pair distances and overall population SD, or summaries of per-pair SDs. Diagonal self-pairs and excluded same-chain neighbors are omitted from these summaries.
 
-Side summaries describe raw eligible distances, not only colored pairs. Line profiles deliberately honor the ranges: Mean uses its range, SD uses the shared Mean selection and its own range. Filtering occurs after per-pair temporal statistics; it does not discard individual frames before mean/SD computation.
+Side summaries describe raw eligible distances, not only colored pairs. Both line profiles honor the shared Mean selection; SD's own range changes its colors only. Filtering occurs after per-pair temporal statistics; it does not discard individual frames before mean/SD computation.
 
 ## Color Scales and Range
 
-In statistics views edit the lower/upper fields at each colorbar's endpoints. The two statistics retain independent viridis scales, while Mean's range also filters pair eligibility in SD. With Auto max checked, the upper field is read-only and shows that statistic's effective raw maximum; uncheck Auto max to edit it. The lower field remains editable.
+In statistics views drag the two cutoff handles on each colorbar or edit its Lower/Upper fields. Each bar displays the upper cutoff, lower cutoff, and midpoint of its full scale. The full scale extends from zero to the raw maximum (or a larger manual upper bound), so handle movement does not continually rescale its track. The two statistics retain independent viridis scales, while Mean's range filters pair eligibility in both SD colors and the SD profile. With Auto max checked, the upper field is read-only and shows the raw maximum; dragging the upper handle disables Auto max. The lower field remains editable.
 
 - **Log** maps in-range values using $[\log(1+x)-\log(1+L)]/[\log(1+U)-\log(1+L)]$, retaining valid zero values when $L=0$.
 - **Linear** maps in-range values using $(x-L)/(U-L)$.
@@ -310,7 +313,7 @@ White denotes structurally unavailable pairs in distance maps. True self-distanc
 - An empty map can result when the object has no protein residues, or when the same-chain neighbor exclusion removes every eligible pair.
 - Closest-pair distance is not currently offered in the dropdown. No external analysis package is required for the available metrics.
 - Distances are ordinary Cartesian Euclidean distances, without periodic minimum-image correction. Unwrap/repair broken molecules before loading if appropriate for the trajectory.
-- Profiles use a linear numeric distance axis and are not changed by the heatmap's Log/Linear transform. A missing profile point means there are no eligible partners in that statistic's range, not a distance of zero.
+- Profiles use a linear numeric distance axis and are not changed by the heatmap's Log/Linear transform. A missing point means no eligible partners remain inside Mean's range, not a distance of zero.
 
 ## Version History
 
@@ -328,7 +331,7 @@ White denotes structurally unavailable pairs in distance maps. True self-distanc
 | **v2** | Moved the optional line-plot checkboxes to a dedicated Line plots section, labeled the mean-of-means and mean-of-SDs axes explicitly, added a Residue label beneath each line plot, and tightened the Cutoff label/input spacing. Release renamed to v2; functionality unchanged. |
 | **v3** | Renamed the third distance definition to closest inter residue atomic distance. Added optional frame-series PNG/CSV export with a destination chooser, frame range/interval, progress and cancellation, unique output folders, and restoration of the original session state. |
 | **v4** | Consolidated export into one upper-right dialog with multiple CSV selection and frame ranges; moved live range/scale controls onto the colorbars; linked Mean pair-selection bounds to SD heatmap/profile exclusions; added a binary cutoff legend with an on-bar slider/field; compacted the header and made the full plot area scrollable. |
-| **v5** | Temporarily removed the closest-distance option; changed residue centers to include all loaded atoms, including hydrogens; moved column residue labels to the top of every heatmap. |
+| **v5** | Temporarily removed the closest-distance option; changed residue centers to include all loaded atoms, including hydrogens; moved column residue labels to the top of every heatmap. Added draggable Mean/SD cutoff handles, Mean-only SD profile filtering, expanded marker-free line plots, and isolated off-screen export rendering with failed-bundle cleanup. |
 
 ## Troubleshooting
 
@@ -340,9 +343,9 @@ White denotes structurally unavailable pairs in distance maps. True self-distanc
 
 **The residue-center view has too few pairs.** Reduce **Exclude same-chain neighbors** or select an object with more protein residues. The view needs at least one eligible residue pair.
 
-**A map has gray cells.** Dark gray is below Min; light gray is above Max. These cells remain in the raw CSV but do not contribute to the profiles. Change that statistic's range or enable its Auto max to include more values.
+**A map has gray cells.** Dark gray is below the lower cutoff; light gray is above the upper cutoff. Values remain in raw matrix CSVs. Mean exclusions remove pairs from both profiles; SD-only exclusions do not remove pairs from the SD profile.
 
-**A profile has gaps or is empty.** No off-diagonal partners survive the filters. For SD, check both Mean limits and SD limits; widening only the SD range cannot restore pairs excluded by Mean. Gaps are not zero.
+**A profile has gaps or is empty.** No off-diagonal partners survive the Mean range and structural/neighbor exclusions. Check Mean cutoffs for either line. Changing SD cutoffs cannot restore excluded pairs or alter its line. Gaps are not zero.
 
 **The range is invalid.** Ensure Min does not exceed Max, including the effective data maximum when Auto max is checked. A static trajectory's SD may be zero everywhere; Min must be zero to use its zero-valued auto range.
 
